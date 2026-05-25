@@ -1,0 +1,55 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# === Virtual Environment ===
+.venv/
+venv/
+env/
+
+# === Secrets & API Keys ===
+config/api_keys.json
+config/memory.json
+config/*.db
+
+# === Memory & Logs ===
+memory/*.json
+memory/*.db
+*.log
+final_log.txt
+start_log.txt
+output.txt
+out.txt
+out2.txt
+out3.txt
+out4.txt
+pip_log.txt
+realtimesst.log
+
+# === Debug & Temp files ===
+debug_*.py
+test_*.py
+get_models.py
+list_google_models.py
+test_routing.py
+test_live_connection.py
+test_vad*.py
+debug_main.py
+
+# === Build ===
+build/
+dist/
+*.egg-info/
+
+# === Models (large files) ===
+models/*.gguf
+models/*.bin
+models/*.pt
+
+# === OS ===
+.DS_Store
+Thumbs.db
+desktop.ini
+models/
