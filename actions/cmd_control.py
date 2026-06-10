@@ -15,11 +15,8 @@ API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 
 def _get_api_key() -> str:
-    try:
-        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f).get("gemini_api_key", "")
-    except Exception:
-        return ""
+    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)["gemini_api_key"]
 
 
 def _get_platform() -> str:
@@ -95,6 +92,10 @@ BLOCKED_PATTERNS = [
     r"\bshutdown\b", r"\brestart-computer\b",
     r"\bstop-process\b", r"\bkill\s+-9\b", r"\btaskkill\b",
     r"\beval\b", r"\b__import__\b",
+    r"Remove-Item.*-Recurse",
+    r"Remove-Item.*-Force",
+    r"ri\s+.*-r",
+    r"for\s+/[fFdDrR]",
 ]
 _BLOCKED_RE = re.compile("|".join(BLOCKED_PATTERNS), re.IGNORECASE)
 
@@ -227,7 +228,6 @@ def cmd_control(
 
     if visible:
         _run_visible(command)
-        output = _run_silent(command)
-        return f"Terminal opened.\n\nOutput:\n{output}"
+        return "Terminal opened with command."
     else:
         return _run_silent(command)

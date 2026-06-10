@@ -4,6 +4,17 @@ from collections import deque
 from PIL import Image, ImageTk, ImageDraw
 import sys
 from pathlib import Path
+from datetime import datetime
+
+
+def _get_fft_bands():
+    """Lit les bandes FFT depuis main.py (import lazy pour éviter les imports circulaires)."""
+    try:
+        import main as _m
+        with _m._fft_lock:
+            return list(_m._fft_bands)
+    except Exception:
+        return None
 
 
 def get_base_dir():
@@ -87,6 +98,16 @@ class JarvisUI:
         self._face_scale_cache = None
         self._load_face(face_path)
 
+        # ── System Monitor, Alerts and Telegram Status ────────────────────────
+        self.notifications = deque(maxlen=8)
+        self.telegram_active = False
+        self.telegram_messages_count = 0
+        try:
+            from core.system_monitor import get_monitor
+            self.monitor = get_monitor()
+        except ImportError:
+            self.monitor = None
+
         # ── Canvas (arka plan animasyon) ─────────────────────────────────────
         self.bg = tk.Canvas(self.root, width=W, height=H,
                             bg=C_BG, highlightthickness=0)
@@ -120,6 +141,9 @@ class JarvisUI:
         # ── Web Agent butonu ──────────────────────────────────────────────────
         self.show_web_agent = False
         self._build_web_button()
+
+        # ── Memory butonu ─────────────────────────────────────────────────────
+        self._build_memory_button()
 
         # ── F4 kısayolu ───────────────────────────────────────────────────────
         self.root.bind("<F4>", lambda e: self._toggle_mute())
@@ -430,6 +454,91 @@ class JarvisUI:
                 c.create_line(x-2, y, x+3, y, fill=C_DIMMER, width=1)
                 c.create_line(x, y-2, x, y+3, fill=C_DIMMER, width=1)
 
+        # ── Diagnostics Panel (Top Right) ────────────────────────────────────
+        if hasattr(self, "monitor") and self.monitor:
+            try:
+                diag = self.monitor.get_ui_data()
+            except Exception:
+                diag = {}
+        else:
+            diag = {}
+
+        cpu = diag.get("cpu_pct") or 0.0
+        ram = diag.get("ram_pct") or 0.0
+        gpu = diag.get("gpu_pct")
+        cpu_t = diag.get("cpu_temp")
+        gpu_t = diag.get("gpu_temp")
+
+        dx = W - 220
+        dy = 85
+        
+        c.create_text(dx, dy, text="📊 SYSTEM DIAGNOSTICS", fill=C_PRI, font=(FONT_MAIN, 10, "bold"), anchor="w")
+        c.create_line(dx, dy + 12, dx + 200, dy + 12, fill=C_MID, width=1)
+        
+        metrics = [("CPU", cpu), ("RAM", ram)]
+        if gpu is not None:
+            metrics.append(("GPU", gpu))
+            
+        bar_y = dy + 25
+        for label, val in metrics:
+            c.create_text(dx, bar_y, text=f"{label}: {val}%", fill=C_TEXT, font=(FONT_MAIN, 9), anchor="w")
+            bx = dx + 60
+            c.create_line(bx, bar_y, bx + 120, bar_y, fill=C_DIMMER, width=8)
+            if val > 0:
+                bar_len = int(120 * (val / 100.0))
+                col = C_PRI
+                if val > 90:
+                    col = C_RED
+                elif val > 75:
+                    col = C_ACC
+                c.create_line(bx, bar_y, bx + bar_len, bar_y, fill=col, width=8)
+            bar_y += 18
+            
+        temp_y = bar_y + 4
+        temp_strs = []
+        if cpu_t is not None:
+            temp_strs.append(f"CPU: {cpu_t}°C")
+        if gpu_t is not None:
+            temp_strs.append(f"GPU: {gpu_t}°C")
+        if temp_strs:
+            c.create_text(dx, temp_y, text="Temp: " + " | ".join(temp_strs), fill=C_ACC2, font=(FONT_MAIN, 9), anchor="w")
+
+        # ── Notifications Panel (Top Left) ────────────────────────────────────
+        nx = 20
+        ny = 85
+        c.create_text(nx, ny, text="🔔 SYSTEM ALERTS", fill=C_ACC, font=(FONT_MAIN, 10, "bold"), anchor="w")
+        c.create_line(nx, ny + 12, nx + 200, ny + 12, fill=C_ACC, width=1)
+        
+        if hasattr(self, "monitor") and self.monitor:
+            try:
+                alerts = self.monitor.get_alerts()
+                for alert in alerts:
+                    sev = alert.get("severity", "info")
+                    icon = "ℹ️"
+                    if sev == "critical":
+                        icon = "🚨"
+                    elif sev == "warning":
+                        icon = "⚠️"
+                    elif alert.get("type") == "drive_connected":
+                        icon = "🔌"
+                    elif alert.get("type") == "drive_disconnected":
+                        icon = "⏏️"
+                    self.add_notification(alert.get("message", ""), icon)
+            except Exception:
+                pass
+                
+        if not self.notifications:
+            c.create_text(nx, ny + 25, text="All systems nominal.", fill=C_GREEN, font=(FONT_MAIN, 9), anchor="w")
+        else:
+            alert_y = ny + 25
+            for timestamp, icon, text in list(self.notifications):
+                time_str = timestamp.strftime("%H:%M:%S")
+                display_text = f"[{time_str}] {icon} {text}"
+                if len(display_text) > 34:
+                    display_text = display_text[:31] + "..."
+                c.create_text(nx, alert_y, text=display_text, fill=C_TEXT, font=(FONT_MAIN, 9), anchor="w")
+                alert_y += 18
+
         # HUD Hex Data Sides
         hud_c = self._ac(0, 229, 255, int(self.halo_a * 0.7))
         for i in range(6):
@@ -574,23 +683,51 @@ class JarvisUI:
 
         c.create_text(W // 2, sy, text=stat, fill=sc, font=(FONT_MAIN, 12, "bold"))
 
-        # ── Ses dalgası ───────────────────────────────────────────────────────
+        # ── Égaliseur de spectre FFT ──────────────────────────────────────────
         wy = sy + 25
         N, BH, bw = 40, 22, 6
         total_w = N * bw
         wx0 = (W - total_w) // 2
         sleeping_ui = (self._jarvis_state == "SLEEPING")
+
+        # Lire les bandes FFT réelles (None si indisponibles)
+        fft_data = None if sleeping_ui or self.muted else _get_fft_bands()
+        _has_fft = fft_data is not None and any(v > 0.01 for v in fft_data)
+
         for i in range(N):
             if self.muted:
                 hb, col = 2, C_MUTED
             elif sleeping_ui:
                 hb, col = int(2 + 1.5 * math.sin(t * 0.025 + i * 0.45)), C_SLEEP
+            elif _has_fft:
+                # ── Données FFT réelles ──
+                raw = fft_data[i] if i < len(fft_data) else 0.0
+                hb = max(2, int(raw * BH))
+                # Couleur dégradée selon l'intensité : cyan → orange vif
+                if raw > 0.75:
+                    col = C_ACC2   # Orange/jaune — pics
+                elif raw > 0.45:
+                    col = C_PRI    # Cyan — medium
+                else:
+                    col = C_MID    # Bleu-cyan — faible
             elif self.speaking:
-                hb, col = random.randint(4, BH), C_PRI if hb > BH * 0.6 else C_MID
+                # Fallback aléatoire si JARVIS parle mais sans données FFT
+                hb = random.randint(4, BH)
+                col = C_PRI if hb > BH * 0.6 else C_MID
             else:
                 hb, col = int(4 + 3 * math.sin(t * 0.1 + i * 0.5)), C_DIM
             bx = wx0 + i * bw
             c.create_rectangle(bx, wy + BH - hb, bx + bw - 2, wy + BH, fill=col, outline="")
+
+        # ── Telegram Remote Status Badge (Bottom Right) ──────────────────────
+        tx = W - 140
+        ty = H - 52
+        if hasattr(self, "telegram_active") and self.telegram_active:
+            c.create_rectangle(tx, ty, tx + 120, ty + 20, fill=C_PANEL, outline=C_GREEN, width=1)
+            c.create_text(tx + 60, ty + 10, text=f"REMOTE ON ({self.telegram_messages_count})", fill=C_GREEN, font=(FONT_MAIN, 8, "bold"))
+        else:
+            c.create_rectangle(tx, ty, tx + 120, ty + 20, fill=C_PANEL, outline=C_DIM, width=1)
+            c.create_text(tx + 60, ty + 10, text="REMOTE OFFLINE", fill=C_DIM, font=(FONT_MAIN, 8))
 
         # ── Footer ────────────────────────────────────────────────────────────
         c.create_rectangle(0, H - 28, W, H, fill="#000a10", outline="")
@@ -691,17 +828,82 @@ class JarvisUI:
         if not gemini:
             return
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        # Préserver les clés existantes (ex. freellmapi_key)
-        existing = {}
-        try:
-            with open(API_FILE, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        except Exception:
-            pass
-        existing["gemini_api_key"] = gemini
         with open(API_FILE, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=4)
+            json.dump({"gemini_api_key": gemini}, f, indent=4)
         self.setup_frame.destroy()
         self._api_key_ready = True
         self.set_state("LISTENING")
         self.write_log("SYS: Systems initialised. JARVIS online.")
+
+    def add_notification(self, text: str, icon: str = "ℹ️"):
+        """Ajoute une notification proactive au panneau latéral."""
+        self.notifications.append((datetime.now(), icon, text))
+
+    def _build_memory_button(self):
+        self.memory_window = None
+        BTN_W, BTN_H = 110, 32
+        BTN_X = 18
+        BTN_Y = self.H - 146
+        self._memory_canvas = tk.Canvas(
+            self.root, width=BTN_W, height=BTN_H,
+            bg=C_BG, highlightthickness=0, cursor="hand2"
+        )
+        self._memory_canvas.place(x=BTN_X, y=BTN_Y)
+        self._memory_canvas.bind("<Button-1>", lambda e: self._show_memory_popup())
+        self._draw_memory_button()
+
+    def _draw_memory_button(self):
+        c = self._memory_canvas
+        c.delete("all")
+        c.create_rectangle(0, 0, 110, 32, outline=C_MID, fill=C_PANEL, width=1)
+        c.create_text(55, 16, text="🧠 MEMORY", fill=C_PRI, font=(FONT_MAIN, 10, "bold"))
+
+    def _show_memory_popup(self):
+        if self.memory_window is not None:
+            self.memory_window.lift()
+            return
+        self.memory_window = tk.Toplevel(self.root)
+        self.memory_window.title("J.A.R.V.I.S — MEMORY CORE DIAGNOSTICS")
+        self.memory_window.geometry("400x380")
+        self.memory_window.configure(bg=C_BG)
+        self.memory_window.resizable(False, False)
+        def on_close():
+            self.memory_window.destroy()
+            self.memory_window = None
+        self.memory_window.protocol("WM_DELETE_WINDOW", on_close)
+
+        tk.Label(self.memory_window, text="🧠 MEMORY MATRIX SUMMARY", fg=C_PRI, bg=C_BG, font=(FONT_MAIN, 12, "bold")).pack(pady=15)
+        
+        from memory.memory_manager import load_memory
+        memory_data = load_memory()
+        categories = ["identity", "preferences", "projects", "relationships", "wishes", "notes"]
+        
+        frame = tk.Frame(self.memory_window, bg=C_BG)
+        frame.pack(fill="both", expand=True, padx=20)
+        
+        row = 0
+        for cat in categories:
+            items = memory_data.get(cat, {})
+            count = len(items)
+            tk.Label(frame, text=cat.upper(), fg=C_TEXT, bg=C_BG, font=(FONT_MAIN, 9), width=15, anchor="w").grid(row=row, column=0, pady=6)
+            bar_canvas = tk.Canvas(frame, width=150, height=14, bg=C_PANEL, highlightthickness=1, highlightbackground=C_DIM)
+            bar_canvas.grid(row=row, column=1, pady=6, padx=5)
+            max_cap = 15.0
+            filled_width = int(150 * (min(count, max_cap) / max_cap))
+            if filled_width > 0:
+                bar_canvas.create_rectangle(0, 0, filled_width, 14, fill=C_PRI, outline="")
+            tk.Label(frame, text=f"{count} items", fg=C_ACC2, bg=C_BG, font=(FONT_MAIN, 9), width=8, anchor="w").grid(row=row, column=2, pady=6)
+            row += 1
+
+        try:
+            from memory.memory_manager import get_vector_memory
+            vm = get_vector_memory()
+            if vm and vm.available:
+                stats = vm.get_stats()
+                total = sum(stats.values())
+                vect_text = f"Vector Memory: ENABLED | {total} semantic elements"
+            else:
+                vect_text = "Vector Memory: OFFLINE (ChromaDB/Sentence-Transformers missing)"
+        except Exception:
+            vect_text = "Vector Memory: ERROR"
+        tk.Label(self.memory_window, text=vect_text, fg=C_GREEN if "ENABLED" in vect_text else C_MUTED, bg=C_BG, font=(FONT_MAIN, 9)).pack(pady=15)

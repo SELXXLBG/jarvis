@@ -13,7 +13,6 @@ pygetwindow
 opencv-python
 numpy
 mss
-Pillow
 psutil
 comtypes
 pycaw
@@ -24,4 +23,14 @@ pywinauto
 python-dotenv
 onnxruntime
 easyocr
-beautifulsoup4
+
+# === JARVIS MARK XXXVI UPGRADES ===
+GPUtil
+wmi
+pywin32
+chromadb
+sentence-transformers
+python-telegram-bot
+schedule
+pyttsx3
+

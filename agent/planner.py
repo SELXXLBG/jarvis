@@ -173,19 +173,14 @@ OUTPUT — return ONLY valid JSON, no markdown, no explanation, no code blocks:
 
 
 def _get_api_key() -> str:
-    try:
-        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f).get("gemini_api_key", "")
-    except Exception:
-        return ""
+    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)["gemini_api_key"]
 
 
 def create_plan(goal: str, context: str = "") -> dict:
     import google.generativeai as genai
 
-    api_key = _get_api_key()
-    if api_key:
-        genai.configure(api_key=api_key)
+    genai.configure(api_key=_get_api_key())
     model = genai.GenerativeModel(
         model_name="gemini-2.5-flash-lite",
         system_instruction=PLANNER_PROMPT
@@ -245,9 +240,7 @@ def _fallback_plan(goal: str) -> dict:
 def replan(goal: str, completed_steps: list, failed_step: dict, error: str) -> dict:
     import google.generativeai as genai
 
-    api_key = _get_api_key()
-    if api_key:
-        genai.configure(api_key=api_key)
+    genai.configure(api_key=_get_api_key())
     model = genai.GenerativeModel(
         model_name="gemini-2.5-flash",
         system_instruction=PLANNER_PROMPT

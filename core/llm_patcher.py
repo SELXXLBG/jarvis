@@ -3,6 +3,7 @@
 
 import sys
 import os
+import re
 import json
 import inspect
 import requests
@@ -13,9 +14,11 @@ from pathlib import Path
 try:
     import google.generativeai as legacy_genai
     ORIGINAL_LEGACY_MODEL = legacy_genai.GenerativeModel
+    ORIGINAL_LEGACY_CONFIGURE = legacy_genai.configure
 except ImportError:
     legacy_genai = None
     ORIGINAL_LEGACY_MODEL = None
+    ORIGINAL_LEGACY_CONFIGURE = None
 
 try:
     import google.genai as new_genai
@@ -27,14 +30,11 @@ except ImportError:
     ORIGINAL_NEW_CLIENT = None
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
+import core.profile_loader
 
 def get_keys():
     try:
-        if API_CONFIG_PATH.exists():
-            with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+        return core.profile_loader.load_api_keys()
     except Exception:
         pass
     return {}
@@ -130,7 +130,7 @@ def analyze_request_complexity(prompt_or_messages) -> bool:
     ]
     
     for kw in complex_keywords:
-        if kw in text_lower:
+        if re.search(r'\b' + re.escape(kw) + r'\b', text_lower):
             return True
             
     return False
@@ -183,7 +183,9 @@ def call_freellmapi(prompt_or_messages, temperature=0.7, tools=None, response_mi
     if response_mime_type == "application/json":
         payload["response_format"] = {"type": "json_object"}
         
-    r = requests.post("http://127.0.0.1:3001/v1/chat/completions", headers=headers, json=payload, timeout=45)
+    config = get_keys()
+    freellmapi_base = config.get("freellmapi_url", "http://127.0.0.1:3001")
+    r = requests.post(f"{freellmapi_base}/v1/chat/completions", headers=headers, json=payload, timeout=45)
     r.raise_for_status()
     return r.json()
 
@@ -193,11 +195,15 @@ class MockGenerativeModel:
         self.model_name = model_name
         self.original_model = None
         real_key = get_real_gemini_key()
-        if real_key and ORIGINAL_LEGACY_MODEL:
-            try:
-                self.original_model = ORIGINAL_LEGACY_MODEL(model_name, *args, **kwargs)
-            except Exception:
-                pass
+        if real_key:
+            os.environ["GOOGLE_API_KEY"] = real_key
+            if ORIGINAL_LEGACY_MODEL:
+                try:
+                    if ORIGINAL_LEGACY_CONFIGURE:
+                        ORIGINAL_LEGACY_CONFIGURE(api_key=real_key)
+                    self.original_model = ORIGINAL_LEGACY_MODEL(model_name, *args, **kwargs)
+                except Exception:
+                    pass
 
     def generate_content(self, contents, generation_config=None, **kwargs):
         freellmapi_key = get_freellmapi_key()
@@ -223,6 +229,12 @@ class MockGenerativeModel:
             return MockResponse(text)
         except Exception as e:
             print(f"[FreeLLMAPI Patcher] Legacy generate_content error (model: {model_choice}): {e}")
+            if self.original_model:
+                print("[FreeLLMAPI Patcher] Falling back to original Google SDK (GenerativeModel)...")
+                try:
+                    return self.original_model.generate_content(contents, generation_config=generation_config, **kwargs)
+                except Exception as fallback_err:
+                    print(f"[FreeLLMAPI Patcher] Fallback failed: {fallback_err}")
             return MockResponse(f"Error calling LLM: {e}")
 
 def mock_configure(*args, **kwargs):
@@ -260,12 +272,19 @@ class MockModelsService:
             return MockResponse(text)
         except Exception as e:
             print(f"[FreeLLMAPI Patcher] New models.generate_content error (model: {model_choice}): {e}")
+            if self.original_client:
+                print("[FreeLLMAPI Patcher] Falling back to original Google SDK (Client.models.generate_content)...")
+                try:
+                    return self.original_client.models.generate_content(model=model, contents=contents, config=config, **kwargs)
+                except Exception as fallback_err:
+                    print(f"[FreeLLMAPI Patcher] Fallback failed: {fallback_err}")
             return MockResponse(f"Error calling LLM: {e}")
 
 class MockChatSession:
-    def __init__(self, model, config=None):
+    def __init__(self, model, config=None, real_client=None):
         self.model = model
         self.config = config
+        self.real_client = real_client
         self.messages = []
         
         sys_inst = None
@@ -305,23 +324,55 @@ class MockChatSession:
             choice = res["choices"][0]["message"]
             content = choice.get("content") or ""
             
-            self.messages.append(choice)
+            self.messages.append({"role": "assistant", "content": content})
             
             fcs = []
             if "tool_calls" in choice:
                 for tc in choice["tool_calls"]:
                     name = tc["function"]["name"]
-                    args = json.loads(tc["function"]["arguments"])
+                    try:
+                        args = json.loads(tc["function"]["arguments"])
+                    except (json.JSONDecodeError, KeyError):
+                        args = {}
                     fcs.append(MockFunctionCall(name, args))
                     
             return MockResponse(content, function_calls=fcs)
         except Exception as e:
             print(f"[FreeLLMAPI Patcher] Error in chat.send_message (model: {model_choice}): {e}")
+            if self.real_client:
+                print("[FreeLLMAPI Patcher] Falling back to original Google SDK (Client.models.generate_content)...")
+                try:
+                    contents = []
+                    for m in self.messages:
+                        role = m.get("role", "user")
+                        if role == "system":
+                            continue
+                        if new_genai_types is not None:
+                            contents.append(new_genai_types.Content(
+                                role=role,
+                                parts=[new_genai_types.Part.from_text(text=m.get("content", ""))]
+                            ))
+                        else:
+                            contents.append({"role": role, "parts": [m.get("content", "")]})
+                    
+                    resp = self.real_client.models.generate_content(
+                        model=self.model,
+                        contents=contents,
+                        config=self.config
+                    )
+                    content = resp.text or ""
+                    self.messages.append({"role": "assistant", "content": content})
+                    return resp
+                except Exception as fallback_err:
+                    print(f"[FreeLLMAPI Patcher] Fallback failed: {fallback_err}")
             return MockResponse(f"Error calling LLM: {e}")
 
 class MockChatsService:
+    def __init__(self, real_client=None):
+        self.real_client = real_client
+
     def create(self, model, config=None, **kwargs):
-        return MockChatSession(model, config)
+        return MockChatSession(model, config, real_client=self.real_client)
 
 class MockClient:
     def __init__(self, api_key=None, http_options=None, **kwargs):
@@ -334,22 +385,18 @@ class MockClient:
                 print(f"[FreeLLMAPI Patcher] Warning: Could not initialize real google client: {e}")
                 
         self.models = MockModelsService(self.real_client)
-        self.chats = MockChatsService()
+        self.chats = MockChatsService(self.real_client)
 
     @property
     def aio(self):
         if self.real_client:
             return self.real_client.aio
-        raise ValueError(
-            "La clé Gemini API est requise pour la voix temps réel (Gemini Live).\n"
-            "Ajoutez 'gemini_api_key' dans config/api_keys.json.\n"
-            "FreeLLMAPI ne supporte pas le streaming audio WebSocket."
-        )
+        raise ValueError("Real Google Client not initialized (check gemini_api_key in config/api_keys.json)")
 
 def patch_sdk():
     freellmapi_key = get_freellmapi_key()
     if freellmapi_key:
-        print(f"[FreeLLMAPI Patcher] FreeLLMAPI key detected ({freellmapi_key[:15]}...). Applying monkeypatches...")
+        print("[FreeLLMAPI Patcher] FreeLLMAPI key detected. Applying monkeypatches...")
         if legacy_genai:
             legacy_genai.GenerativeModel = MockGenerativeModel
             legacy_genai.configure = mock_configure

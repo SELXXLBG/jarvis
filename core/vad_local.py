@@ -4,8 +4,7 @@ import numpy as np
 
 try:
     import onnxruntime
-    # Force disable ONNX to lighten the program (use RMS fallback instead)
-    _ONNX_AVAILABLE = False
+    _ONNX_AVAILABLE = True
 except ImportError:
     _ONNX_AVAILABLE = False
     print("[VAD] ⚠️ onnxruntime non installé — VAD par défaut (RMS) sera utilisé")
@@ -55,7 +54,7 @@ class LocalVAD:
                 providers=['CPUExecutionProvider'], 
                 sess_options=opts
             )
-            print("[VAD] 🧠 Modèle d'inintelligence artificielle local VAD prêt.")
+            print("[VAD] 🧠 Modèle d'intelligence artificielle local VAD prêt.")
         except Exception as e:
             print(f"[VAD] ❌ Erreur de chargement ONNX: {e}")
             self.enabled = False
@@ -92,9 +91,11 @@ class LocalVAD:
         try:
             out, self._h, self._c = self.session.run(None, inputs)
         except Exception as e:
+            # Reset state on error
             self._h = np.zeros((2, 1, 64), dtype=np.float32)
             self._c = np.zeros((2, 1, 64), dtype=np.float32)
             out = [[0.0]]
+            print(f"[VAD] ⚠️ Inference error (speech detection disabled for this chunk): {e}")
 
         # out[0][0] contient la probabilité (0.0 à 1.0) qu'il y ait de la parole
         prob = float(out[0][0])

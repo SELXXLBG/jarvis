@@ -17,40 +17,8 @@ BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 def _get_api_key() -> str:
-    try:
-        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f).get("gemini_api_key", "")
-    except Exception:
-        return ""
-
-def _get_freellmapi_key() -> str:
-    try:
-        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f).get("freellmapi_key", "")
-    except Exception:
-        return ""
-
-def _freellm_search(query: str) -> str:
-    """Recherche via FreeLLMAPI avec google_search grounding."""
-    import requests as req
-    key = _get_freellmapi_key()
-    if not key:
-        raise ValueError("No FreeLLMAPI key")
-    r = req.post(
-        "http://127.0.0.1:3001/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={
-            "model": "gemini-2.5-flash-lite",
-            "messages": [{"role": "user", "content": query}],
-            "temperature": 0.3,
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    text = r.json()["choices"][0]["message"]["content"].strip()
-    if not text:
-        raise ValueError("Empty response")
-    return text
+    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)["gemini_api_key"]
 
 
 def _gemini_search(query: str) -> str:
@@ -150,24 +118,17 @@ def web_search(
             print("[WebSearch] ✅ Compare done.")
             return result
 
-        # Priorité : FreeLLMAPI → Gemini direct → DuckDuckGo
-        print("[WebSearch] 🌐 FreeLLMAPI search...")
+        print("[WebSearch] 🌐 Gemini search...")
         try:
-            result = _freellm_search(query)
-            print("[WebSearch] ✅ FreeLLMAPI OK.")
+            result = _gemini_search(query)
+            print("[WebSearch] ✅ Gemini OK.")
             return result
-        except Exception as e1:
-            print(f"[WebSearch] ⚠️ FreeLLMAPI failed ({e1}), trying Gemini direct...")
-            try:
-                result = _gemini_search(query)
-                print("[WebSearch] ✅ Gemini OK.")
-                return result
-            except Exception as e2:
-                print(f"[WebSearch] ⚠️ Gemini failed ({e2}), trying DDG...")
-                results = _ddg_search(query)
-                result  = _format_ddg(query, results)
-                print(f"[WebSearch] ✅ DDG: {len(results)} results.")
-                return result
+        except Exception as e:
+            print(f"[WebSearch] ⚠️ Gemini failed ({e}), trying DDG...")
+            results = _ddg_search(query)
+            result  = _format_ddg(query, results)
+            print(f"[WebSearch] ✅ DDG: {len(results)} results.")
+            return result
 
     except Exception as e:
         print(f"[WebSearch] ❌ Failed: {e}")

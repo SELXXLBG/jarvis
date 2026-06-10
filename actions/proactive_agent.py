@@ -45,6 +45,13 @@ def get_system_overview():
     overview += "\nLocal AI Assets:\n"
     for s in ai_status:
         overview += f"  - {s}\n"
+        
+    # Hardware Status
+    try:
+        from core.system_monitor import get_monitor
+        overview += f"\nHardware Status:\n  - {get_monitor().get_summary_text()}\n"
+    except Exception:
+        pass
     
     # Check for active windows if on Windows
     if system == "Windows":

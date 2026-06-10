@@ -33,6 +33,18 @@ MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
 _lock            = Lock()
 MAX_VALUE_LENGTH = 400
 
+_vector_mem = None
+
+def get_vector_memory():
+    global _vector_mem
+    if _vector_mem is None:
+        try:
+            from memory.vector_memory import VectorMemory
+            _vector_mem = VectorMemory()
+        except Exception as e:
+            print(f"[Memory] ⚠️ Failed to initialize VectorMemory: {e}")
+    return _vector_mem
+
 
 def _empty_memory() -> dict:
     return {
@@ -118,6 +130,19 @@ def update_memory(memory_update: dict) -> dict:
     if _recursive_update(memory, memory_update):
         save_memory(memory)
         print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
+        
+        # Sync to Vector Memory
+        vm = get_vector_memory()
+        if vm and vm.available:
+            for category, entries in memory_update.items():
+                if isinstance(entries, dict):
+                    for key, entry in entries.items():
+                        if isinstance(entry, dict) and "value" in entry:
+                            val = str(entry["value"])
+                        else:
+                            val = str(entry)
+                        if val.strip():
+                            vm.store_fact(category, key, val)
     return memory
 
 
@@ -218,74 +243,11 @@ def _extract_memory_local(combined: str) -> dict:
     return {}
 
 
-def _get_freellmapi_key() -> str:
-    try:
-        config_path = BASE_DIR / "config" / "api_keys.json"
-        if config_path.exists():
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f).get("freellmapi_key", "")
-    except Exception:
-        pass
-    return ""
-
-
-def _extract_memory_via_freellmapi(combined: str) -> dict:
-    """Extraction via FreeLLMAPI (OpenAI-compatible endpoint)."""
-    import requests as req
-
-    key = _get_freellmapi_key()
-    if not key:
-        return {}
-
-    prompt = (
-        "You are JARVIS's memory extraction module. Extract EVERY memorable detail about the user from this conversation. "
-        "Think like a loyal sidekick who wants to know everything about their master to serve them better.\n\n"
-        "Include:\n"
-        "  - Explicit facts (name, age, job).\n"
-        "  - Implicit preferences (topics they enjoy, their mood, how they like to be addressed).\n"
-        "  - Ongoing tasks or projects they mention.\n"
-        "  - People they talk about and their relationship to them.\n"
-        "  - Habits, routines, or schedules hinted at.\n\n"
-        "Category guide:\n"
-        "  identity      → name, age, birthday, city, country, job, school, nationality, language\n"
-        "  preferences   → favorites, dislikes, style, UI preferences\n"
-        "  projects      → projects being built, coding tasks, learning objectives\n"
-        "  relationships → friends, family, partner, colleagues, pets\n"
-        "  wishes        → travel, purchases, career goals, bucket list\n"
-        "  notes         → routines, habits, specific URLs, any other context\n\n"
-        "Return ONLY valid JSON. Use {} if truly nothing is worth saving.\n"
-        "Use concise English values regardless of conversation language.\n\n"
-        'Format: {"identity":{"name":{"value":"John"}}, "preferences":{"theme":{"value":"dark mode"}}}\n\n'
-        f"Conversation:\n{combined}\n\nJSON:"
-    )
-
-    try:
-        r = req.post(
-            "http://127.0.0.1:3001/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={
-                "model": "gemini-2.5-flash-lite",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=20,
-        )
-        r.raise_for_status()
-        text = r.json()["choices"][0]["message"]["content"].strip()
-        text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
-        if not text or text == "{}":
-            return {}
-        return json.loads(text)
-    except Exception as e:
-        print(f"[Memory] ⚠️ FreeLLMAPI extraction failed: {e}")
-        return {}
-
-
 def extract_memory(user_text: str, jarvis_text: str, api_key: str) -> dict:
     """
     Stage 2 : Extraction détaillée.
-    Priorité : Ollama local → FreeLLMAPI → Gemini direct (si clé dispo).
+    Tente d'abord une extraction LOCALE via Ollama pour économiser les tokens.
+    Fallback sur Google Gemini si Ollama n'est pas dispo ou échoue.
     """
     global _memory_quota_until, _cooldown_logged
 
@@ -300,28 +262,35 @@ def extract_memory(user_text: str, jarvis_text: str, api_key: str) -> dict:
     except Exception:
         pass
 
-    # --- FreeLLMAPI (prioritaire sur Gemini direct) ---
-    freellm_data = _extract_memory_via_freellmapi(combined)
-    if freellm_data:
-        print(f"[Memory] 🌐 Extraction FreeLLMAPI réussie")
-        return freellm_data
-
-    # --- FALLBACK CLOUD (Gemini direct — uniquement si clé dispo) ---
-    if not api_key:
-        return {}
-
+    # --- FALLBACK CLOUD (Gemini) ---
     if time.time() < _memory_quota_until:
         return {}
 
     try:
         from google import genai
 
-        client = genai.Client(api_key=api_key)
-
+        client  = genai.Client(api_key=api_key)
+        
         prompt = (
-            "You are JARVIS's memory extraction module. Extract memorable facts from this conversation.\n"
-            "Return ONLY valid JSON. Use {} if nothing is worth saving.\n"
-            'Format: {"identity":{"name":{"value":"John"}}, "preferences":{"theme":{"value":"dark mode"}}}\n\n'
+            "You are JARVIS's memory extraction module. Extract EVERY memorable detail about the user from this conversation. "
+            "Think like a loyal sidekick who wants to know everything about their master to serve them better.\n\n"
+            "Include:\n"
+            "  - Explicit facts (name, age, job).\n"
+            "  - Implicit preferences (topics they enjoy, their mood, how they like to be addressed).\n"
+            "  - Ongoing tasks or projects they mention.\n"
+            "  - People they talk about and their relationship to them.\n"
+            "  - Habits, routines, or schedules hinted at.\n"
+            "  - Specific tools or websites they frequently use.\n\n"
+            "Category guide:\n"
+            "  identity      → name, age, birthday, city, country, job, school, nationality, language, mood/personality traits\n"
+            "  preferences   → favorites, dislikes, style, UI preferences, conversational tone preferred\n"
+            "  projects      → projects being built, coding tasks, gaming goals, learning objectives\n"
+            "  relationships → friends, family, partner, colleagues, pets, even enemies/rivals\n"
+            "  wishes        → travel, purchases, career goals, bucket list, immediate needs\n"
+            "  notes         → routines, habits, passwords (if hinted), specific URLs, any other context\n\n"
+            "Return ONLY valid JSON. Use {} if truly nothing is worth saving.\n"
+            "Use concise English values regardless of conversation language.\n\n"
+            'Format: {"identity":{"traits":{"value":"curious"}}, "preferences":{"theme":{"value":"dark mode"}}}\n\n'
             f"Conversation:\n{combined}\n\nJSON:"
         )
 
@@ -330,9 +299,11 @@ def extract_memory(user_text: str, jarvis_text: str, api_key: str) -> dict:
             contents=prompt,
         )
         raw = response.text.strip()
+
         raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
         if not raw or raw == "{}":
             return {}
+
         return json.loads(raw)
 
     except json.JSONDecodeError:
@@ -440,6 +411,12 @@ def forget(key: str, category: str = "notes") -> str:
         del cat[key]
         memory[category] = cat
         save_memory(memory)
+        
+        # Delete from Vector Memory
+        vm = get_vector_memory()
+        if vm and vm.available:
+            vm.delete_fact(category, key)
+            
         return f"Forgotten: {category}/{key}"
     return f"Not found: {category}/{key}"
 

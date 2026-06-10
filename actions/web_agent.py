@@ -15,12 +15,10 @@ from google import genai
 from google.genai import types
 
 def _get_api_key() -> str:
-    try:
-        config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
-        with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f).get("gemini_api_key", "")
-    except Exception:
-        return ""
+    base = Path(__file__).resolve().parent.parent
+    config_path = base / "config" / "api_keys.json"
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)["gemini_api_key"]
 
 # On utilise le modèle Flash standard (très rapide, très bon marché en tokens textuels)
 MODEL_ID = "gemini-2.5-flash"

@@ -39,12 +39,11 @@ BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 import json
+import re
+
 def _get_api_key() -> str:
-    try:
-        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f).get("gemini_api_key", "")
-    except Exception:
-        return ""
+    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)["gemini_api_key"]
 
 
 def volume_up():
@@ -95,19 +94,47 @@ def volume_set(value: int):
         subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"])
         return
 
-def brightness_up():
+def brightness_up() -> str:
     if _OS == "Windows":
-        pyautogui.hotkey("win", "a")
-        time.sleep(0.3)
+        try:
+            import wmi
+            c = wmi.WMI(namespace='wmi')
+            methods = c.WmiMonitorBrightnessMethods()[0]
+            monitors = c.WmiMonitorBrightness()
+            if monitors:
+                current = monitors[0].CurrentBrightness
+                new_val = min(100, current + 10)
+                methods.WmiSetBrightness(new_val, 0)
+                return f"Brightness increased to {new_val}%"
+        except Exception:
+            pass
+        # Fallback: keyboard brightness key simulation
+        import pyautogui
+        pyautogui.press('brightnessup')
+        return "Brightness key pressed (up)"
     elif _OS == "Darwin":
         subprocess.run(["osascript", "-e", "tell application \"System Events\" to key code 144"])
     else:
         subprocess.run(["brightnessctl", "set", "+10%"])
 
-def brightness_down():
+def brightness_down() -> str:
     if _OS == "Windows":
-        pyautogui.hotkey("win", "a")
-        time.sleep(0.3)
+        try:
+            import wmi
+            c = wmi.WMI(namespace='wmi')
+            methods = c.WmiMonitorBrightnessMethods()[0]
+            monitors = c.WmiMonitorBrightness()
+            if monitors:
+                current = monitors[0].CurrentBrightness
+                new_val = max(0, current - 10)
+                methods.WmiSetBrightness(new_val, 0)
+                return f"Brightness decreased to {new_val}%"
+        except Exception:
+            pass
+        # Fallback: keyboard brightness key simulation
+        import pyautogui
+        pyautogui.press('brightnessdown')
+        return "Brightness key pressed (down)"
     elif _OS == "Darwin":
         subprocess.run(["osascript", "-e", "tell application \"System Events\" to key code 145"])
     else:
@@ -277,9 +304,19 @@ def type_text(text: str, press_enter_after: bool = False):
     if not text:
         return
     if _PYPERCLIP:
+        try:
+            original_clipboard = pyperclip.paste()  # backup
+        except Exception:
+            original_clipboard = None
         pyperclip.copy(text)
         time.sleep(0.1)
         paste()
+        time.sleep(0.1)
+        if original_clipboard is not None:
+            try:
+                pyperclip.copy(original_clipboard)  # restore
+            except Exception:
+                pass
     else:
         pyautogui.write(str(text), interval=0.03)
     if press_enter_after:
@@ -337,17 +374,21 @@ def sleep_display():
     else:
         subprocess.run(["xset", "dpms", "force", "off"])
 
-def restart_computer():
+def restart_computer() -> str:
+    # Safety: 10s delay gives the user time to cancel with 'shutdown /a'
     if _OS == "Windows":
-        subprocess.run(["shutdown", "/r", "/t", "5"])
+        subprocess.run(["shutdown", "/r", "/t", "10"])
+        return "PC restarting in 10 seconds. Say 'abort shutdown' to cancel."
     elif _OS == "Darwin":
         subprocess.run(["osascript", "-e", 'tell application "System Events" to restart'])
     else:
         subprocess.run(["sudo", "reboot"])
 
-def shutdown_computer():
+def shutdown_computer() -> str:
+    # Safety: 10s delay gives the user time to cancel with 'shutdown /a'
     if _OS == "Windows":
-        subprocess.run(["shutdown", "/s", "/t", "5"])
+        subprocess.run(["shutdown", "/s", "/t", "10"])
+        return "PC shutting down in 10 seconds. Say 'abort shutdown' to cancel."
     elif _OS == "Darwin":
         subprocess.run(["osascript", "-e", 'tell application "System Events" to shut down'])
     else:
@@ -591,7 +632,7 @@ IMPORTANT:
     try:
         response = model.generate_content(prompt)
         text = response.text.strip()
-        text = __import__("re").sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+        text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
         return json.loads(text)
     except Exception as e:
         print(f"[Settings] ⚠️ Intent detection failed: {e}")

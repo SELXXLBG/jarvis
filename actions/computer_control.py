@@ -50,6 +50,16 @@ def get_base_dir() -> Path:
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
+_cached_api_key: str | None = None
+
+def _get_cached_api_key() -> str:
+    global _cached_api_key
+    if _cached_api_key is None:
+        cfg_path = Path(__file__).parent.parent / "config" / "api_keys.json"
+        with open(cfg_path, "r") as f:
+            _cached_api_key = json.load(f).get("gemini_api_key", "")
+    return _cached_api_key
+
 
 def _load_user_profile() -> dict:
     """Load user profile from long_term.json for form filling."""
@@ -153,7 +163,22 @@ def _type_text(text: str, interval: float = 0.03) -> str:
     """Types text at the current cursor position."""
     _ensure_pyautogui()
     time.sleep(0.3)
-    pyautogui.typewrite(text, interval=interval)
+    if _PYPERCLIP:
+        try:
+            original_clipboard = pyperclip.paste()
+        except Exception:
+            original_clipboard = None
+        pyperclip.copy(text)
+        time.sleep(0.1)
+        pyautogui.hotkey("ctrl", "v") if platform.system() != "Darwin" else pyautogui.hotkey("command", "v")
+        time.sleep(0.1)
+        if original_clipboard is not None:
+            try:
+                pyperclip.copy(original_clipboard)
+            except Exception:
+                pass
+    else:
+        pyautogui.typewrite(text, interval=interval)
     return f"Typed: {text[:50]}{'...' if len(text) > 50 else ''}"
 
 
@@ -218,8 +243,8 @@ def _move_mouse(x: int, y: int, duration: float = 0.3) -> str:
 def _drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5) -> str:
     """Drags from (x1,y1) to (x2,y2)."""
     _ensure_pyautogui()
-    pyautogui.drag(x1 - pyautogui.position()[0], y1 - pyautogui.position()[1])
-    pyautogui.dragTo(x2, y2, duration=duration)
+    pyautogui.moveTo(x1, y1)
+    pyautogui.dragTo(x2, y2, duration=duration, button='left')
     return f"Dragged from ({x1},{y1}) to ({x2},{y2})"
 
 
@@ -254,8 +279,9 @@ def _screenshot(save_path: str = None) -> str:
 
 def _wait(seconds: float) -> str:
     """Waits for specified seconds."""
+    seconds = min(float(seconds), 30.0)
     time.sleep(seconds)
-    return f"Waited {seconds}s"
+    return f"Waited {seconds:.1f}s"
 
 
 def _wait_for_image(image_path: str, timeout: int = 10) -> str:
@@ -339,13 +365,9 @@ def _analyze_screen_for_element(description: str) -> tuple[int, int] | None:
         import google.generativeai as genai
         import io
 
-        try:
-            with open(API_CONFIG_PATH, "r") as f:
-                api_key = json.load(f).get("gemini_api_key", "")
-        except Exception:
-            api_key = ""
-        if api_key:
-            genai.configure(api_key=api_key)
+        api_key = _get_cached_api_key()
+
+        genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
 

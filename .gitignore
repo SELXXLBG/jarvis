@@ -1,55 +1,18 @@
-# === Python ===
-__pycache__/
-*.py[cod]
-*$py.class
-*.pyc
+models/kokoro/*.onnx
 
-# === Virtual Environment ===
-.venv/
-venv/
-env/
+# Ignore individual user API keys in profiles
+profiles/*/api_keys.json
 
-# === Secrets & API Keys ===
+# Local env file overrides
+.env
+
+# Legacy config file
 config/api_keys.json
-config/memory.json
-config/*.db
 
-# === Memory & Logs ===
+# Local runtime memory files and models
 memory/*.json
-memory/*.db
-*.log
-final_log.txt
-start_log.txt
-output.txt
-out.txt
-out2.txt
-out3.txt
-out4.txt
-pip_log.txt
-realtimesst.log
-
-# === Debug & Temp files ===
-debug_*.py
-test_*.py
-get_models.py
-list_google_models.py
-test_routing.py
-test_live_connection.py
-test_vad*.py
-debug_main.py
-
-# === Build ===
-build/
-dist/
-*.egg-info/
-
-# === Models (large files) ===
-models/*.gguf
-models/*.bin
-models/*.pt
-
-# === OS ===
-.DS_Store
-Thumbs.db
-desktop.ini
+memory/chromadb/
 models/
+__pycache__/
+*/__pycache__/
+

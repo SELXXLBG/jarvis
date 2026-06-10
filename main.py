@@ -7,7 +7,106 @@ import re
 import time
 import struct
 import math
+import array
 from pathlib import Path
+
+try:
+    import numpy as np
+    _NUMPY_AVAILABLE = True
+except ImportError:
+    _NUMPY_AVAILABLE = False
+    print("[JARVIS] ⚠️ numpy non disponible — FFT désactivé")
+
+try:
+    import pyttsx3 as _pyttsx3_mod
+    _PYTTSX3_AVAILABLE = True
+except ImportError:
+    _PYTTSX3_AVAILABLE = False
+    print("[JARVIS] ⚠️ pyttsx3 non disponible — TTS offline désactivé")
+
+# ── FFT spectrum shared buffer (40 bandes, mis à jour en temps réel) ──────────
+FFT_BANDS      = 40
+_fft_bands     = [0.0] * FFT_BANDS   # amplitudes normalisées [0.0 … 1.0]
+_fft_lock      = threading.Lock()
+
+# ── pyttsx3 engine (lazy init, thread-safe via lock) ─────────────────────────
+_tts_engine    = None
+_tts_lock      = threading.RLock()
+
+
+def _get_tts_engine():
+    """Retourne le moteur pyttsx3 (créé une fois, thread-safe)."""
+    global _tts_engine
+    if not _PYTTSX3_AVAILABLE:
+        return None
+    with _tts_lock:
+        if _tts_engine is None:
+            try:
+                _tts_engine = _pyttsx3_mod.init()
+                # Choisir une voix masculine anglaise si disponible
+                voices = _tts_engine.getProperty("voices")
+                for v in voices:
+                    if "male" in v.name.lower() or "david" in v.name.lower() or "mark" in v.name.lower():
+                        _tts_engine.setProperty("voice", v.id)
+                        break
+                _tts_engine.setProperty("rate", 170)
+                _tts_engine.setProperty("volume", 0.9)
+            except Exception as e:
+                print(f"[JARVIS] ❌ pyttsx3 init failed: {e}")
+                _tts_engine = None
+    return _tts_engine
+
+
+def _speak_offline(text: str) -> None:
+    """Synthèse vocale locale via pyttsx3 (bloquant, appeler dans un thread)."""
+    engine = _get_tts_engine()
+    if engine is None:
+        print(f"[TTS-Offline] ⚠️ pyttsx3 unavailable. Message: {text}")
+        return
+    try:
+        with _tts_lock:
+            engine.say(text)
+            engine.runAndWait()
+    except Exception as e:
+        print(f"[TTS-Offline] ❌ {e}")
+
+
+def _compute_fft_bands(pcm_bytes: bytes, sample_rate: int = 16000) -> list:
+    """
+    Calcule FFT sur les données PCM int16 et retourne FFT_BANDS amplitudes
+    normalisées entre 0.0 et 1.0. Ignore les fréquences > 8000 Hz.
+    """
+    if not _NUMPY_AVAILABLE or len(pcm_bytes) < 2:
+        return [0.0] * FFT_BANDS
+    try:
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+        N = len(samples)
+        if N < 64:
+            return [0.0] * FFT_BANDS
+        # FFT magnitude (moitié positive du spectre)
+        fft_mag = np.abs(np.fft.rfft(samples)) / N
+        # Fréquences correspondantes
+        freqs = np.fft.rfftfreq(N, d=1.0 / sample_rate)
+        # Répartir en FFT_BANDS bandes de fréquences (log-scale, 20 Hz – 8000 Hz)
+        f_min, f_max = 20.0, min(8000.0, sample_rate / 2.0)
+        log_min = math.log10(max(f_min, 1))
+        log_max = math.log10(f_max)
+        bands = []
+        for i in range(FFT_BANDS):
+            lo = 10 ** (log_min + (log_max - log_min) * (i / FFT_BANDS))
+            hi = 10 ** (log_min + (log_max - log_min) * ((i + 1) / FFT_BANDS))
+            mask = (freqs >= lo) & (freqs < hi)
+            if mask.any():
+                val = float(np.mean(fft_mag[mask]))
+            else:
+                val = 0.0
+            bands.append(val)
+        # Normalisation : max observé sur cette frame (+ protection zéro)
+        max_val = max(bands) if max(bands) > 0 else 1.0
+        bands = [min(b / max_val, 1.0) for b in bands]
+        return bands
+    except Exception:
+        return [0.0] * FFT_BANDS
 
 try:
     import speech_recognition as sr
@@ -26,6 +125,37 @@ from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
     should_extract_memory, extract_memory
 )
+
+# === Imports optionnels JARVIS Mark XXXVI ===
+try:
+    from core.system_monitor import SystemMonitor, get_monitor
+except ImportError as e:
+    print(f"[JARVIS] ⚠️ system_monitor unavailable: {e}")
+    SystemMonitor = None; get_monitor = lambda: None  # noqa
+
+try:
+    from core.scheduler import JarvisScheduler
+except ImportError as e:
+    print(f"[JARVIS] ⚠️ scheduler unavailable: {e}")
+    JarvisScheduler = None  # noqa
+
+try:
+    from core.presence_detector import PresenceDetector
+except ImportError as e:
+    print(f"[JARVIS] ⚠️ presence_detector unavailable: {e}")
+    PresenceDetector = None  # noqa
+
+try:
+    from core.telegram_bot import JarvisTelegramBot, get_telegram_bot
+except ImportError as e:
+    print(f"[JARVIS] ⚠️ telegram_bot unavailable: {e}")
+    JarvisTelegramBot = None; get_telegram_bot = lambda: None  # noqa
+
+try:
+    from memory.vector_memory import VectorMemory, format_vector_results
+except ImportError as e:
+    print(f"[JARVIS] ⚠️ vector_memory unavailable: {e}")
+    VectorMemory = None; format_vector_results = lambda x, **kw: ""  # noqa
 
 from actions.flight_finder     import flight_finder
 from actions.open_app          import open_app
@@ -47,6 +177,7 @@ from actions.game_updater      import game_updater
 from actions.web_agent         import web_agent
 from actions.spotify_control   import spotify_control
 from actions.proactive_agent   import proactive_check
+from actions.protocols         import execute_protocol
 
 
 def get_base_dir():
@@ -55,9 +186,9 @@ def get_base_dir():
     return Path(__file__).resolve().parent
 
 
+import core.profile_loader
+
 BASE_DIR        = get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
-PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "gemini-2.5-flash-native-audio-latest"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
@@ -76,22 +207,11 @@ NON_BLOCKING_TOOLS  = {
 
 
 def _get_api_key() -> str:
-    try:
-        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f).get("gemini_api_key", "")
-    except Exception:
-        return ""
+    return core.profile_loader.load_api_keys().get("gemini_api_key", "")
 
 
 def _load_system_prompt() -> str:
-    try:
-        return PROMPT_PATH.read_text(encoding="utf-8")
-    except Exception:
-        return (
-            "You are JARVIS, Tony Stark's AI assistant. "
-            "Be concise, direct, and always use the provided tools to complete tasks. "
-            "Never simulate or guess results — always call the appropriate tool."
-        )
+    return core.profile_loader.get_system_prompt()
 
 
 # ── Mémoire ───────────────────────────────────────────────────────────────────
@@ -109,7 +229,7 @@ def _update_memory_async(user_text: str, jarvis_text: str) -> None:
     _last_memory_input = user_text
 
     try:
-        api_key = _get_api_key()  # peut être vide, memory_manager gère le fallback FreeLLMAPI
+        api_key = _get_api_key()
         if not should_extract_memory(user_text, jarvis_text, api_key):
             return
         data = extract_memory(user_text, jarvis_text, api_key)
@@ -522,6 +642,78 @@ TOOL_DECLARATIONS = [
             "required": []
         }
     },
+    {
+        "name": "system_diagnostics",
+        "description": "Retrieves the real-time system metrics (CPU, RAM, GPU, temperature, disks, etc.) to analyze system health.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "search_memory",
+        "description": "Searches sémantiquement through the vector long-term memory for past conversations, documents, and facts.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {"type": "STRING", "description": "Semantic search query"},
+                "collection": {"type": "STRING", "description": "Optional: 'conversations', 'facts', or 'documents'. Defaults to all."}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "presence_detection_control",
+        "description": "Enables or disables webcam-based presence detection.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "enable": {"type": "BOOLEAN", "description": "True to enable detection, False to disable."}
+            },
+            "required": ["enable"]
+        }
+    },
+    {
+        "name": "execute_protocol",
+        "description": (
+            "Executes a Stark Industries emergency protocol. "
+            "'clean_slate': closes all browsers, clears clipboard, empties recycle bin, locks the PC. "
+            "'house_party': sets volume to 50%, opens VSCode/Chrome/Discord, launches Spotify. "
+            "'sentry': enables continuous webcam monitoring, alerting via Telegram if an intruder is detected. "
+            "Use when the user says 'activate protocol X', 'initiate X', or 'launch X protocol'."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "protocol_name": {
+                    "type": "STRING",
+                    "description": "Name of the protocol: 'clean_slate', 'house_party', or 'sentry'"
+                }
+            },
+            "required": ["protocol_name"]
+        }
+    },
+    {
+        "name": "network_diagnostics",
+        "description": (
+            "Runs a network diagnostic: measures internet ping and download speed, "
+            "scans for suspicious active connections on sensitive ports (SSH, RDP, VNC, etc.), "
+            "and reports potential cybersecurity threats. "
+            "Use when user asks: 'test my connection', 'what is my internet speed', "
+            "'is my network secure', 'check for intrusions', etc."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "mode": {
+                    "type": "STRING",
+                    "description": "'full' (default): speed + security | 'speed': speedtest only | 'security': security scan only"
+                }
+            },
+            "required": []
+        }
+    },
 ]
 
 
@@ -574,6 +766,17 @@ class JarvisLive:
 
         self.ui.on_text_command = self._on_text_command
 
+        # ── Mark XXXVI services state ────────────────────────────────────────
+        self._telegram_request = None
+        self._telegram_lock = threading.Lock()
+        self._system_monitor = None
+        self._scheduler = None
+        self._presence_detector = None
+        self._telegram_bot = None
+        
+        # Start background services
+        self._start_services()
+
     # ── Wake word helpers ─────────────────────────────────────────────────────
 
     @property
@@ -590,8 +793,16 @@ class JarvisLive:
         print("[JARVIS] 🟢 Wake word détecté — JARVIS actif")
         self.ui.set_state("LISTENING")
         self.ui.write_log("SYS: ✅ JARVIS — mode actif")
-        # Réponse vocale de réveil
-        self.speak("Oui, je vous écoute.")
+        # Vérifier que la session est toujours vivante avant de parler
+        if self._loop and self.session:
+            self.speak("Oui, je vous écoute.")
+        else:
+            # Session morte (1011) — TTS offline pour signaler le problème
+            threading.Thread(
+                target=_speak_offline,
+                args=("Session reconnecting, one moment sir.",),
+                daemon=True
+            ).start()
 
     def _go_to_sleep(self):
         """Met JARVIS en veille. Appelé quand le mot de mise en veille est détecté."""
@@ -661,11 +872,11 @@ class JarvisLive:
                     self._wake_up()
 
             except Exception as e:
-                err_msg = str(e).lower()
-                if "aborted" not in err_msg:
+                err_str = str(e).lower()
+                if "aborted" not in err_str:
                     print(f"[WakeWord] ⚠️ {e}")
-                if "could not find pyaudio" in err_msg:
-                    print("[WakeWord] 🛑 Désactivation du WakeWord pour éviter les lags (PyAudio introuvable).")
+                if "could not find pyaudio" in err_str:
+                    print("[WakeWord] 🛑 Arrêt du thread WakeWord (PyAudio introuvable).")
                     break
                 time.sleep(1)
 
@@ -770,15 +981,35 @@ class JarvisLive:
         )
 
         parts = [time_ctx]
+
+        # ── Mémoire : limitée à 1500 caractères pour ne pas surcharger le prompt ──
         if mem_str:
+            if len(mem_str) > 1500:
+                mem_str = mem_str[:1500] + "\n... (memory truncated for performance)"
             parts.append(mem_str)
+
+        # ── Status système : injecté UNIQUEMENT si déjà disponible (sans bloquer) ──
+        # Un appel bloquant ici retarde la connexion et peut causer l'erreur 1011.
+        try:
+            from core.system_monitor import get_monitor
+            mon = get_monitor()
+            # Ne récupérer le status que si le monitor tourne déjà (pas de cold-start)
+            if hasattr(mon, '_running') and mon._running:
+                status_text = mon.get_summary_text()
+                # Limiter à 300 chars pour rester léger
+                if len(status_text) > 300:
+                    status_text = status_text[:300] + "..."
+                parts.append(f"[SYSTEM STATUS]\n{status_text}\n\n")
+        except Exception:
+            pass
+
         parts.append(sys_prompt)
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
-            output_audio_transcription=types.AudioTranscriptionConfig(),
-            # input_audio_transcription retiré — dégrade les performances avec un flux audio continu
-            # et cause des erreurs 1011 côté serveur après quelques échanges
+            # output_audio_transcription retiré — gemini-2.5-flash-native-audio-latest
+            # ne supporte pas la combinaison AUDIO+TEXT (erreur 1007).
+            # La transcription vocale reste disponible via input_transcription dans receive().
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": TOOL_DECLARATIONS}],
             speech_config=types.SpeechConfig(
@@ -891,6 +1122,76 @@ class JarvisLive:
             elif name == "web_agent":
                 r = await loop.run_in_executor(None, lambda: web_agent(parameters=args, player=self.ui, speak=self.speak))
                 result = r or "Done."
+
+            elif name == "system_diagnostics":
+                if self._system_monitor:
+                    result = self._system_monitor.get_summary_text()
+                else:
+                    result = "System Monitor is not initialized."
+
+            elif name == "search_memory":
+                query = args.get("query", "")
+                collection = args.get("collection")
+                if collection == "all":
+                    collection = None
+                from memory.vector_memory import format_vector_results
+                from memory.memory_manager import get_vector_memory
+                vm = get_vector_memory()
+                if vm and vm.available:
+                    res = vm.search(query, collection=collection)
+                    result = format_vector_results(res) or "No relevant semantic memories found."
+                else:
+                    result = "Vector memory system is offline."
+
+            elif name == "presence_detection_control":
+                enable = args.get("enable", False)
+                if self._presence_detector:
+                    self._presence_detector.set_enabled(enable)
+                    state = "enabled" if enable else "disabled"
+                    self.ui.write_log(f"SYS: Presence detection {state}.")
+                    result = f"Presence detection has been {state}."
+                else:
+                    result = "Presence detector is offline."
+
+            elif name == "execute_protocol":
+                protocol_name = args.get("protocol_name", "")
+                if protocol_name.lower() in ("sentry",):
+                    # Sentry mode: activer la surveillance via activate_sentry()
+                    if self._presence_detector:
+                        r = self._presence_detector.activate_sentry()
+                        result = r
+                        self.ui.write_log("SYS: 🛡️ Protocol SENTRY activated.")
+                    else:
+                        result = "Sentry mode unavailable: presence detector offline."
+                else:
+                    r = await loop.run_in_executor(
+                        None,
+                        lambda: execute_protocol(protocol_name, player=self.ui)
+                    )
+                    result = r or f"Protocol '{protocol_name}' executed."
+                    self.ui.write_log(f"SYS: 🛡️ Protocol {protocol_name.upper()} executed.")
+
+            elif name == "network_diagnostics":
+                mode = args.get("mode", "full").lower()
+                from core.network_diagnostics import get_network_diagnostics
+                nd = get_network_diagnostics()
+                if mode == "speed":
+                    spd = await loop.run_in_executor(None, nd.get_speedtest)
+                    result = nd.format_speedtest(spd)
+                elif mode == "security":
+                    alerts = await loop.run_in_executor(None, nd.get_security_alerts)
+                    if alerts:
+                        lines = [f"{len(alerts)} security alert(s) detected:"]
+                        for a in alerts:
+                            lines.append(
+                                f"  [{a['service']} port {a['port']}] "
+                                f"process={a['process']} remote={a.get('raddr','?')}:{a.get('rport','?')}"
+                            )
+                        result = "\n".join(lines)
+                    else:
+                        result = "No suspicious connections detected. Network appears secure."
+                else:
+                    result = await loop.run_in_executor(None, nd.full_report)
 
             else:
                 result = f"Unknown tool: {name}"
@@ -1010,6 +1311,50 @@ class JarvisLive:
             msg = await self.out_queue.get()
             await self.session.send_realtime_input(media=msg)
 
+    def _safe_put_audio_chunk(self, blob):
+        """Put an audio blob in the queue, dropping the oldest chunk if full."""
+        if self.out_queue is None:
+            return
+        try:
+            self.out_queue.put_nowait(blob)
+        except asyncio.QueueFull:
+            try:
+                # Drop oldest chunk to prevent lagging and QueueFull exceptions
+                self.out_queue.get_nowait()
+                self.out_queue.put_nowait(blob)
+            except Exception:
+                pass
+
+    async def _keepalive_session(self):
+        """
+        Envoie un silence PCM minuscule toutes les 25 secondes quand JARVIS est en veille,
+        pour éviter que le serveur Gemini ferme la session (erreur 1011 Deadline Expired).
+        La session Gemini Live expire après ~2-3 minutes d'inactivité complète.
+        """
+        # 160ms de silence PCM int16 @ 16kHz = 160ms * 16000 * 2 octets = 5120 octets
+        SILENCE_CHUNK = bytes(5120)  # Zeros = silence parfait
+        KEEPALIVE_INTERVAL = 25      # secondes entre chaque envoi
+
+        print("[JARVIS] 📶 Keepalive task started (interval: 25s)")
+
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+
+            # N'envoyer le keepalive QUE si JARVIS est en veille
+            # (Quand actif, le micro envoie déjà de l'audio régulier)
+            if not self.awake:
+                try:
+                    silence_blob = types.Blob(
+                        data=SILENCE_CHUNK,
+                        mime_type="audio/pcm;rate=16000"
+                    )
+                    await self.session.send_realtime_input(media=silence_blob)
+                except Exception as e:
+                    # Si ça échoue, la session est morte — la boucle principale
+                    # gèrera la reconnexion via le gestionnaire d'erreurs de run()
+                    print(f"[JARVIS] ⚠️ Keepalive failed (session dead?): {e}")
+                    raise  # Propager l'erreur pour déclencher la reconnexion
+
     async def _listen_audio(self):
         """
         Capture audio et envoie à Gemini.
@@ -1029,6 +1374,13 @@ class JarvisLive:
 
             data = indata.tobytes()
 
+            # ── FFT Mic spectrum ─────────────────────────────────────────────
+            if _NUMPY_AVAILABLE and self.awake:
+                bands = _compute_fft_bands(data, SEND_SAMPLE_RATE)
+                with _fft_lock:
+                    for k in range(FFT_BANDS):
+                        _fft_bands[k] = bands[k]
+
             # ── VAD : IA Neuronal (Silero) ou Mathématique (RMS) ─────────────
             is_voice_detected = False
 
@@ -1037,11 +1389,13 @@ class JarvisLive:
                 is_voice_detected = self._local_vad.is_speech(data, threshold=0.5)
             else:
                 # Fallback mathématique bourrin (RMS) si le modèle IA n'est pas dispo
-                count = len(data) // 2
-                if count > 0:
+                if _NUMPY_AVAILABLE and len(data) >= 2:
+                    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                    rms = int(np.sqrt(np.mean(samples ** 2))) if len(samples) > 0 else 0
+                elif len(data) >= 2:
+                    count = len(data) // 2
                     shorts = struct.unpack(f"<{count}h", data)
-                    sum_squares = sum(s * s for s in shorts)
-                    rms = int(math.sqrt(sum_squares / count))
+                    rms = int(math.sqrt(sum(s * s for s in shorts) / count))
                 else:
                     rms = 0
                 is_voice_detected = (rms > VAD_THRESHOLD)
@@ -1076,7 +1430,7 @@ class JarvisLive:
             if self.awake:
                 # Utilisation du type types.Blob exact avec le rate explicite
                 blob = types.Blob(data=data, mime_type="audio/pcm;rate=16000")
-                loop.call_soon_threadsafe(self.out_queue.put_nowait, blob)
+                loop.call_soon_threadsafe(self._safe_put_audio_chunk, blob)
 
         try:
             with sd.InputStream(
@@ -1142,6 +1496,13 @@ class JarvisLive:
                             if full_out:
                                 self.ui.write_log(f"Jarvis: {full_out}")
                                 self._add_to_history("jarvis", full_out)
+                                
+                            # Forward response to pending Telegram command
+                            if hasattr(self, "_telegram_request") and self._telegram_request is not None:
+                                self._telegram_request["response"] = full_out or "(Command executed successfully)"
+                                self._telegram_request["event"].set()
+                                self.ui.telegram_messages_count += 1
+                                
                             out_buf = []
 
                             # La mise en veille est gérée uniquement via l'outil sleep_mode appelé par Gemini
@@ -1167,47 +1528,39 @@ class JarvisLive:
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
 
-        stream = sd.RawOutputStream(
+        with sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
             channels=CHANNELS,
             dtype="int16",
             blocksize=CHUNK_SIZE,
-        )
-        stream.start()
-        try:
-            while True:
-                chunk = await self.audio_in_queue.get()
-                self.set_speaking(True)
-                await asyncio.to_thread(stream.write, chunk)
-        except Exception as e:
-            print(f"[JARVIS] ❌ Play: {e}")
-            raise
-        finally:
-            self.set_speaking(False)
-            stream.stop()
-            stream.close()
+        ) as stream:
+            try:
+                while True:
+                    chunk = await self.audio_in_queue.get()
+                    self.set_speaking(True)
+                    # ── FFT Playback spectrum ─────────────────────────────────
+                    if _NUMPY_AVAILABLE:
+                        bands = _compute_fft_bands(chunk, RECEIVE_SAMPLE_RATE)
+                        with _fft_lock:
+                            for k in range(FFT_BANDS):
+                                _fft_bands[k] = bands[k]
+                    await asyncio.to_thread(stream.write, chunk)
+            except Exception as e:
+                print(f"[JARVIS] ❌ Play: {e}")
+                raise
+            finally:
+                self.set_speaking(False)
+                # Reset spectrum to zero when playback stops
+                with _fft_lock:
+                    for k in range(FFT_BANDS):
+                        _fft_bands[k] = 0.0
 
     # ── Main run loop with reconnection — inspiré d'ADA V2 ───────────────────
 
     async def run(self):
-        api_key = _get_api_key()
-        if not api_key:
-            msg = (
-                "⚠️  Clé Gemini API manquante.\n"
-                "La voix temps réel (Gemini Live) nécessite une clé Gemini.\n"
-                "Ajoutez 'gemini_api_key' dans config/api_keys.json.\n"
-                "Les outils texte (recherche, mémoire, code...) fonctionnent avec FreeLLMAPI."
-            )
-            print(f"[JARVIS] {msg}")
-            self.ui.write_log("ERR: Clé Gemini manquante — voix désactivée. Voir console.")
-            self.ui.set_state("SLEEPING")
-            # Garder l'UI vivante en mode texte seulement
-            while True:
-                await asyncio.sleep(60)
-
         client = genai.Client(
-            api_key=api_key,
-            http_options={"api_version": "v1beta"}
+            api_key=_get_api_key(),
+            http_options={"api_version": "v1alpha"}
         )
 
         retry_delay    = 1
@@ -1249,13 +1602,25 @@ class JarvisLive:
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
+                    tg.create_task(self._keepalive_session())  # ← garde la session vivante
 
                     # Reset retry delay on successful connection
                     retry_delay = 1
 
             except Exception as e:
+                err_str = str(e)
                 print(f"[JARVIS] ⚠️ {e}")
                 traceback.print_exc()
+
+                # ── Offline TTS fallback via pyttsx3 ─────────────────────────
+                # Si la connexion est perdue (réseau, quota, WebSocket), JARVIS
+                # parle localement pour signaler l'incident.
+                if any(k in err_str for k in ("429", "503", "WebSocket", "ConnectionError", "timeout", "1011", "1013")):
+                    threading.Thread(
+                        target=_speak_offline,
+                        args=("Sir, direct connection lost. Activating local communications backup.",),
+                        daemon=True
+                    ).start()
 
             self.set_speaking(False)
             self.ui.set_state("THINKING")
@@ -1265,6 +1630,224 @@ class JarvisLive:
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 10)  # 1s → 2s → 4s → 8s → max 10s
             is_reconnect = True
+
+    # ── Mark XXXVI Services & Callbacks ───────────────────────────────────────
+
+    def _start_services(self):
+        # 1. System Monitor
+        try:
+            from core.system_monitor import get_monitor
+            self._system_monitor = get_monitor()
+            self._system_monitor.start()
+            self.ui.write_log("SYS: System Monitor initialized.")
+        except Exception as e:
+            print(f"[JARVIS] ⚠️ Failed to start System Monitor: {e}")
+
+        # 2. Vector Memory Initialization
+        try:
+            from memory.memory_manager import get_vector_memory
+            vm = get_vector_memory()
+            if vm and vm.available:
+                self.ui.write_log("SYS: Vector Memory loaded.")
+            else:
+                self.ui.write_log("SYS: Vector Memory offline.")
+        except Exception as e:
+            print(f"[JARVIS] ⚠️ Failed to initialize Vector Memory: {e}")
+
+        # 3. Presence Detector (disabled by default)
+        try:
+            from core.presence_detector import PresenceDetector
+            self._presence_detector = PresenceDetector()
+            self._presence_detector.on_user_arrived(self._on_user_arrived)
+            self._presence_detector.on_user_left(self._on_user_left)
+            # Hook fatigue and mood callbacks
+            self._presence_detector.on_fatigue_detected(self._on_fatigue_detected)
+            self._presence_detector.on_mood_changed(self._on_mood_changed)
+            # Hook Sentry intruder callback
+            self._presence_detector.on_intruder_detected(self._on_intruder_detected_sentry)
+            self._presence_detector.start()
+            self.ui.write_log("SYS: Presence Detector standby (Disabled).")
+        except Exception as e:
+            print(f"[JARVIS] ⚠️ Failed to start Presence Detector: {e}")
+
+        # 4. Scheduler
+        try:
+            from core.scheduler import JarvisScheduler
+            self._scheduler = JarvisScheduler()
+            self._scheduler.start(on_alert_callback=self._on_scheduler_alert)
+            self.ui.write_log("SYS: Scheduler active.")
+        except Exception as e:
+            print(f"[JARVIS] ⚠️ Failed to start Scheduler: {e}")
+
+        # 5. Telegram Bot
+        try:
+            from core.telegram_bot import get_telegram_bot
+            self._telegram_bot = get_telegram_bot()
+            self._telegram_bot.start(
+                on_command_callback=self._on_telegram_command,
+                get_status_callback=self._telegram_get_status,
+                get_memory_callback=self._telegram_get_memory,
+                wake_callback=self._telegram_wake
+            )
+            if self._telegram_bot.is_running():
+                self.ui.telegram_active = True
+                self.ui.write_log("SYS: Telegram remote bot online.")
+            else:
+                self.ui.write_log("SYS: Telegram bot configuration missing.")
+        except Exception as e:
+            print(f"[JARVIS] ⚠️ Failed to start Telegram Bot: {e}")
+
+    def _on_user_arrived(self):
+        self.ui.write_log("SYS: User presence detected.")
+        if not self.awake:
+            self._wake_up()
+        if self._scheduler and self.session:
+            asyncio.run_coroutine_threadsafe(
+                self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": "System Notification: User has arrived. Please perform the morning briefing."}]},
+                    turn_complete=True
+                ),
+                self._loop
+            )
+
+    def _on_user_left(self):
+        self.ui.write_log("SYS: User left. Entering standby.")
+        if self.awake:
+            self._go_to_sleep()
+
+    def _on_fatigue_detected(self, fatigued: bool):
+        """Callback: triggered when presence detector detects fatigue."""
+        if fatigued and self.awake and self.session and self._loop:
+            self.ui.write_log("SYS: ⚠️ Fatigue detected — alerting user.")
+            asyncio.run_coroutine_threadsafe(
+                self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": (
+                        "System Alert: Fatigue detected. The user appears tired (eyes closed repeatedly). "
+                        "Please say a short, caring message encouraging them to take a break."
+                    )}]},
+                    turn_complete=True
+                ),
+                self._loop
+            )
+
+    def _on_mood_changed(self, mood: str):
+        """Callback: triggered when presence detector detects a mood change."""
+        if mood and mood not in ("unknown", "neutral") and self.awake and self.session and self._loop:
+            self.ui.write_log(f"SYS: Mood detected — {mood}.")
+            asyncio.run_coroutine_threadsafe(
+                self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": (
+                        f"System Alert: Mood analysis indicates the user appears {mood}. "
+                        f"Adapt your tone accordingly and briefly acknowledge."
+                    )}]},
+                    turn_complete=True
+                ),
+                self._loop
+            )
+
+    def _on_intruder_detected_sentry(self, jpeg_bytes: bytes, timestamp: str):
+        """
+        Callback Sentry : envoi photo sur Telegram + log HUD.
+        Called from PresenceDetector._sentry_alert_worker in a daemon thread.
+        """
+        self.ui.write_log(f"SYS: 🚨 SENTRY — INTRUDER at {timestamp} — Telegram alert sent!")
+        self.ui.add_notification(f"🚨 Intruder detected! {timestamp}", "🚨")
+
+        # Envoyer la photo sur Telegram si le bot est actif
+        if self._telegram_bot and self._telegram_bot.is_running():
+            caption = f"🚨 [JARVIS SENTRY] Intruder detected at {timestamp}\nWorkstation locked."
+            self._telegram_bot.send_photo(jpeg_bytes, caption=caption)
+        else:
+            print(f"[Sentry] ⚠️ Telegram bot offline — photo NOT sent remotely (saved locally).")
+
+        # Annoncer vocalement si JARVIS est éveillé
+        if self.awake and self.session and self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": (
+                        "System Alert: Sentry Mode triggered. An intruder has been detected in front of the webcam. "
+                        "Photo sent to Telegram. Workstation is being locked. Please confirm."
+                    )}]},
+                    turn_complete=True
+                ),
+                self._loop
+            )
+
+    def _on_scheduler_alert(self, alert_type: str, message: str, data: dict = None):
+        icon = "⚠️"
+        if alert_type == "morning":
+            icon = "☀️"
+        elif alert_type == "evening":
+            icon = "🌙"
+        elif alert_type == "health":
+            icon = "🚨"
+        
+        self.ui.add_notification(message, icon)
+        
+        if self._telegram_bot:
+            self._telegram_bot.send_notification(f"[{icon} ALERT] {message}")
+            
+        if self.awake and self.session and self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": f"System Alert: {message}"}]},
+                    turn_complete=True
+                ),
+                self._loop
+            )
+
+    def _on_telegram_command(self, text: str) -> str:
+        with self._telegram_lock:
+            if not self._loop or not self.session:
+                return "JARVIS is currently offline or connecting."
+                
+            req = {
+                "text": text,
+                "event": threading.Event(),
+                "response": ""
+            }
+            self._telegram_request = req
+            
+            if not self.awake:
+                self._wake_up()
+                
+            self.ui.write_log(f"Telegram: {text}")
+            
+            asyncio.run_coroutine_threadsafe(
+                self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": text}]},
+                    turn_complete=True
+                ),
+                self._loop
+            )
+            
+            success = req["event"].wait(timeout=25.0)
+            self._telegram_request = None
+            
+            if success:
+                return req["response"]
+            else:
+                return "Timeout: JARVIS was unable to respond in time."
+
+    def _telegram_get_status(self) -> str:
+        if self._system_monitor:
+            return self._system_monitor.get_summary_text()
+        return "System Monitor offline."
+
+    def _telegram_get_memory(self) -> str:
+        try:
+            from memory.memory_manager import load_memory, format_memory_for_prompt
+            mem = load_memory()
+            total_keys = sum(len(mem.get(cat, {})) for cat in mem)
+            summary = f"Total facts stored: {total_keys}\n\n"
+            summary += format_memory_for_prompt(mem)
+            return summary
+        except Exception as e:
+            return f"Error: {e}"
+
+    def _telegram_wake(self):
+        self._wake_up()
+        self.ui.write_log("SYS: Woken up via Telegram.")
 
 
 def main():

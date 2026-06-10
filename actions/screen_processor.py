@@ -69,7 +69,7 @@ def _get_api_key() -> str:
             keys = json.load(f)
         key = keys.get("gemini_api_key", "")
         if not key:
-            raise ValueError("La vision nécessite une clé Gemini API (gemini_api_key dans config/api_keys.json)")
+            raise ValueError("gemini_api_key not found")
         return key
     except Exception as e:
         raise RuntimeError(f"Could not load API key: {e}")

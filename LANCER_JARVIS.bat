@@ -4,7 +4,9 @@ echo    J.A.R.V.I.S - INITIALISATION SYSTEME
 echo ==========================================
 echo.
 echo Activation du support UTF-8...
+chcp 65001 >nul 2>&1
 set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
 
 rem Verification de l'environnement virtuel
 if not exist ".venv\Scripts\python.exe" goto no_venv
@@ -14,8 +16,9 @@ echo Lancement de JARVIS via environnement virtuel...
 goto end
 
 :no_venv
+echo [ERREUR] Dossier .venv introuvable.
 echo Tentative via Python global...
-py main.py
+python main.py
 goto end
 
 :end
