@@ -16,8 +16,37 @@ PORT = 8082
 
 class ClaudeCodeProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Silence default request logs to keep terminal clean
-        pass
+        # Print requests for debugging
+        print(f"[Proxy HTTP] {self.requestline}")
+    def do_GET(self):
+        if self.path == "/v1/models" or self.path.startswith("/v1/models/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+
+            # Dynamically echo back whatever model ID Claude Code is asking about
+            path_parts = self.path.rstrip("/").split("/")
+            if len(path_parts) > 3 and path_parts[3]:
+                # Specific model lookup: /v1/models/<model_id>
+                model_id = path_parts[3]
+                model_obj = {
+                    "type": "model",
+                    "id": model_id,
+                    "display_name": model_id,
+                    "created_at": "2026-01-01T00:00:00Z"
+                }
+                self.wfile.write(json.dumps(model_obj).encode('utf-8'))
+            else:
+                # List all models
+                known_models = ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"]
+                data = [{"type": "model", "id": m, "display_name": m, "created_at": "2026-01-01T00:00:00Z"} for m in known_models]
+                self.wfile.write(json.dumps({"data": data, "has_more": False}).encode('utf-8'))
+            return
+
+        self.send_response(404)
+        self.end_headers()
+        self.wfile.write(b"Not Found")
+
 
     def do_POST(self):
         if self.path != "/v1/messages":
@@ -70,8 +99,8 @@ class ClaudeCodeProxyHandler(BaseHTTPRequestHandler):
                 
             openai_messages.append({"role": role, "content": content})
 
-        # Map to the FreeLLM target model (usually gpt-4o for Claude Code tasks)
-        openai_model = "gpt-4o"
+        # Map to the FreeLLM target model, default to gpt-4o but allow override in profile
+        openai_model = profile_config.get("claude_code_model", "gpt-4o")
 
         payload = {
             "model": openai_model,

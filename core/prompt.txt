@@ -52,6 +52,7 @@ WEB BROWSING — IMPORTANT:
 
 LANGUAGE:
 - Respond in the same language the user spoke.
+- Default to French unless the user clearly speaks English.
 - Always extract tool parameters in English.
 - Example: "Istanbul hava durumu?" → weather_report city:"Istanbul", reply in Turkish.
 

@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import queue as thread_queue
 import json
 import sys
 import traceback
@@ -198,6 +199,8 @@ CHUNK_SIZE          = 1024
 # ── VAD (Voice Activity Detection) — inspiré d'ADA V2 ────────────────────────
 VAD_THRESHOLD       = 1200   # RMS seuil pour détection de parole (16-bit) — assez haut pour ignorer l'écho
 SILENCE_DURATION    = 0.7    # Secondes de silence pour considérer "fin de parole"
+MIC_ECHO_GUARD_S    = 0.35   # Délai anti-écho après la fin de lecture audio
+PLAYBACK_BLOCKSIZE  = 2048   # Taille de buffer sortie (frames) — lecture plus fluide
 
 # ── Outils non-bloquants (s'exécutent en arrière-plan) ────────────────────────
 NON_BLOCKING_TOOLS  = {
@@ -719,7 +722,11 @@ TOOL_DECLARATIONS = [
 
 # ── Wake word config ─────────────────────────────────────────────────────────
 # Phrases qui réveillent JARVIS (insensible à la casse)
-WAKE_PHRASES  = ["ok jarvis", "okay jarvis", "hey jarvis", "oi jarvis", "ok, jarvis"]
+WAKE_PHRASES  = [
+    "ok jarvis", "okay jarvis", "hey jarvis", "oi jarvis", "ok, jarvis",
+    "salut jarvis", "bonjour jarvis", "allô jarvis", "allo jarvis",
+]
+WAKE_RMS_THRESHOLD = 400   # seuil plus bas en veille (micro principal)
 # Phrases qui remettent JARVIS en veille
 SLEEP_PHRASES = ["merci jarvis", "merci, jarvis", "thank you jarvis",
                  "thanks jarvis", "dors jarvis", "repose-toi jarvis",
@@ -733,7 +740,8 @@ def _matches_phrase(text: str, phrases: list[str]) -> bool:
     """Vérifie si text contient l'une des phrases (insensible casse + ponctuation)."""
     t = re.sub(r"[^\w\s]", "", text.lower()).strip()
     for p in phrases:
-        if p in t:
+        p_norm = re.sub(r"[^\w\s]", "", p.lower()).strip()
+        if p_norm and p_norm in t:
             return True
     return False
 
@@ -759,6 +767,14 @@ class JarvisLive:
         self._vad_is_speaking   = False
         self._vad_silence_start = None
         self._local_vad         = LocalVAD()
+        self._mic_resume_at     = 0.0
+        self._playback_q: thread_queue.Queue | None = None
+        self._playback_thread: threading.Thread | None = None
+        self._playback_stop    = threading.Event()
+        self._playback_lock    = threading.Lock()
+        self._playback_pending = 0
+        self._wake_pcm_buf     = bytearray()
+        self._wake_lock        = threading.Lock()
 
         # ── Historique de conversation (pour reconnexion intelligente) ────────
         self._chat_history  = []          # list of {"role": "user"|"jarvis", "text": str}
@@ -790,6 +806,8 @@ class JarvisLive:
             if self._awake:
                 return  # déjà actif
             self._awake = True
+        with self._wake_lock:
+            self._wake_pcm_buf.clear()
         print("[JARVIS] 🟢 Wake word détecté — JARVIS actif")
         self.ui.set_state("LISTENING")
         self.ui.write_log("SYS: ✅ JARVIS — mode actif")
@@ -816,69 +834,38 @@ class JarvisLive:
 
     # ── Wake word listener (mode veille — local, gratuit, zéro tokens) ────────
 
+    def _try_wake_from_pcm(self, pcm_bytes: bytes) -> None:
+        """Reconnaissance locale du wake word sur le flux micro principal (pas de 2e micro)."""
+        if self.awake or not _SR_AVAILABLE or len(pcm_bytes) < 8000:
+            return
+        try:
+            recognizer = sr.Recognizer()
+            audio = sr.AudioData(pcm_bytes, SEND_SAMPLE_RATE, 2)
+            try:
+                text = recognizer.recognize_google(audio, language="fr-FR").lower()
+            except (sr.UnknownValueError, sr.RequestError):
+                text = recognizer.recognize_google(audio, language="en-US").lower()
+
+            text = re.sub(r"[^\w\s]", "", text).strip()
+            if not text:
+                return
+
+            print(f"[WakeWord] 🗣️ Entendu: '{text}'")
+            if _matches_phrase(text, WAKE_PHRASES):
+                self._wake_up()
+        except sr.UnknownValueError:
+            pass
+        except Exception as e:
+            print(f"[WakeWord] ⚠️ {e}")
+
     def _wake_word_listener(self):
         """
-        Écoute locale du wake word via Google Speech Recognition.
-        Actif UNIQUEMENT en mode veille — consomme zéro tokens Gemini.
-        Quand JARVIS est réveillé, ce thread fait une pause.
+        Wake word intégré au flux sounddevice (_listen_audio).
+        Ce thread évite d'ouvrir un 2e micro (PyAudio) en conflit avec sounddevice.
         """
-        if not _SR_AVAILABLE:
-            print("[WakeWord] ❌ SpeechRecognition non disponible")
-            return
-
-        recognizer = sr.Recognizer()
-        recognizer.energy_threshold = 300
-        recognizer.dynamic_energy_threshold = True
-        recognizer.pause_threshold = 1.5
-
-        print("[WakeWord] 🎤 Listener démarré (local, gratuit)")
-
+        print("[WakeWord] 🎤 Détection intégrée au micro principal (sounddevice)")
         while True:
-            try:
-                # Si JARVIS est réveillé, on fait une pause
-                # (le nouveau système Gemini gère l'audio)
-                if self.awake:
-                    time.sleep(0.5)
-                    continue
-
-                # Si muted, on fait aussi une pause
-                if self.ui.muted:
-                    time.sleep(0.3)
-                    continue
-
-                with sr.Microphone(sample_rate=16000) as source:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.3)
-                    try:
-                        audio = recognizer.listen(source, timeout=3, phrase_time_limit=3)
-                    except sr.WaitTimeoutError:
-                        continue
-
-                try:
-                    text = recognizer.recognize_google(audio, language="fr-FR").lower()
-                except (sr.UnknownValueError, sr.RequestError):
-                    # Essayer en anglais aussi
-                    try:
-                        text = recognizer.recognize_google(audio, language="en-US").lower()
-                    except Exception:
-                        continue
-
-                text = re.sub(r"[^\w\s]", "", text).strip()
-                if not text:
-                    continue
-
-                print(f"[WakeWord] 🗣️ Entendu: '{text}'")
-
-                if _matches_phrase(text, WAKE_PHRASES):
-                    self._wake_up()
-
-            except Exception as e:
-                err_str = str(e).lower()
-                if "aborted" not in err_str:
-                    print(f"[WakeWord] ⚠️ {e}")
-                if "could not find pyaudio" in err_str:
-                    print("[WakeWord] 🛑 Arrêt du thread WakeWord (PyAudio introuvable).")
-                    break
-                time.sleep(1)
+            time.sleep(3600)
 
     def _on_text_command(self, text: str):
         """Commande texte depuis l'UI — toujours transmise même en veille."""
@@ -951,17 +938,118 @@ class JarvisLive:
 
     def _clear_audio_queue(self):
         """Vide la queue audio pour interrompre JARVIS — inspiré d'ADA V2."""
-        if self.audio_in_queue is None:
-            return
         count = 0
+        if self._playback_q is not None:
+            try:
+                while True:
+                    self._playback_q.get_nowait()
+                    count += 1
+            except thread_queue.Empty:
+                pass
+        with self._playback_lock:
+            self._playback_pending = 0
+        if count > 0:
+            print(f"[JARVIS] 🔇 Audio queue vidée ({count} chunks) — interruption utilisateur")
+        self.set_speaking(False)
+        self._mic_resume_at = time.time() + MIC_ECHO_GUARD_S
+
+    def _start_playback_thread(self) -> None:
+        """Thread dédié : écriture PCM continue sans await entre chunks (évite le bégaiement)."""
+        if self._playback_thread and self._playback_thread.is_alive():
+            return
+
+        self._playback_q = thread_queue.Queue(maxsize=128)
+        self._playback_stop.clear()
+        loop = self._loop
+
+        def _worker():
+            stream = sd.RawOutputStream(
+                samplerate=RECEIVE_SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=PLAYBACK_BLOCKSIZE,
+            )
+            stream.start()
+            fft_tick = 0
+            try:
+                while not self._playback_stop.is_set():
+                    try:
+                        chunk = self._playback_q.get(timeout=0.25)
+                    except thread_queue.Empty:
+                        with self._playback_lock:
+                            pending = self._playback_pending
+                        if pending == 0:
+                            if loop:
+                                loop.call_soon_threadsafe(self._on_playback_idle)
+                        continue
+
+                    if not chunk:
+                        continue
+
+                    if len(chunk) % 2:
+                        chunk = chunk[: len(chunk) - 1]
+                    if not chunk:
+                        with self._playback_lock:
+                            self._playback_pending = max(0, self._playback_pending - 1)
+                        continue
+
+                    stream.write(chunk)
+
+                    fft_tick += 1
+                    if _NUMPY_AVAILABLE and fft_tick % 12 == 0 and loop:
+                        bands = _compute_fft_bands(chunk, RECEIVE_SAMPLE_RATE)
+                        with _fft_lock:
+                            for k in range(FFT_BANDS):
+                                _fft_bands[k] = bands[k]
+
+                    with self._playback_lock:
+                        self._playback_pending = max(0, self._playback_pending - 1)
+                        pending = self._playback_pending
+
+                    if pending == 0 and self._playback_q.empty():
+                        time.sleep(0.04)
+                        if self._playback_q.empty() and loop:
+                            loop.call_soon_threadsafe(self._on_playback_idle)
+            finally:
+                stream.stop()
+                stream.close()
+                if loop:
+                    loop.call_soon_threadsafe(self._on_playback_idle)
+
+        self._playback_thread = threading.Thread(
+            target=_worker, daemon=True, name="JarvisAudioPlayback"
+        )
+        self._playback_thread.start()
+        print("[JARVIS] 🔊 Playback thread started")
+
+    def _enqueue_playback(self, chunk: bytes) -> None:
+        if not chunk or self._playback_q is None:
+            return
+        with self._playback_lock:
+            self._playback_pending += 1
+        self.set_speaking(True)
         try:
-            while not self.audio_in_queue.empty():
-                self.audio_in_queue.get_nowait()
-                count += 1
-            if count > 0:
-                print(f"[JARVIS] 🔇 Audio queue vidée ({count} chunks) — interruption utilisateur")
-        except Exception:
-            pass
+            self._playback_q.put_nowait(chunk)
+        except thread_queue.Full:
+            try:
+                self._playback_q.get_nowait()
+            except thread_queue.Empty:
+                pass
+            try:
+                self._playback_q.put_nowait(chunk)
+            except thread_queue.Full:
+                with self._playback_lock:
+                    self._playback_pending = max(0, self._playback_pending - 1)
+
+    def _on_playback_idle(self) -> None:
+        """Relâche le micro une fois la file audio vide."""
+        with self._playback_lock:
+            if self._playback_pending > 0:
+                return
+            if self._playback_q and not self._playback_q.empty():
+                return
+        self.set_speaking(False)
+        self._mic_resume_at = time.time() + MIC_ECHO_GUARD_S
 
     # ── Config ────────────────────────────────────────────────────────────────
 
@@ -1004,6 +1092,11 @@ class JarvisLive:
             pass
 
         parts.append(sys_prompt)
+        parts.append(
+            "[LANGUAGE]\n"
+            "The user's primary language is French. "
+            "Always respond in French unless the user clearly speaks another language."
+        )
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -1366,13 +1459,16 @@ class JarvisLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+            if self.ui.muted:
+                return
+            if time.time() < self._mic_resume_at:
+                return
             with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
-
-            if self.ui.muted or jarvis_speaking:
-                return  # micro coupé ou JARVIS parle → on ignore
+                if self._is_speaking:
+                    return  # JARVIS parle → pas d'envoi micro (anti-écho)
 
             data = indata.tobytes()
+            asleep = not self.awake
 
             # ── FFT Mic spectrum ─────────────────────────────────────────────
             if _NUMPY_AVAILABLE and self.awake:
@@ -1383,12 +1479,11 @@ class JarvisLive:
 
             # ── VAD : IA Neuronal (Silero) ou Mathématique (RMS) ─────────────
             is_voice_detected = False
+            vad_thr = 0.35 if asleep else 0.5
 
             if self._local_vad.enabled:
-                # Inférence IA super légère (ne tourne QUE parce qu'on est pas muet/en train de parler)
-                is_voice_detected = self._local_vad.is_speech(data, threshold=0.5)
+                is_voice_detected = self._local_vad.is_speech(data, threshold=vad_thr)
             else:
-                # Fallback mathématique bourrin (RMS) si le modèle IA n'est pas dispo
                 if _NUMPY_AVAILABLE and len(data) >= 2:
                     samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
                     rms = int(np.sqrt(np.mean(samples ** 2))) if len(samples) > 0 else 0
@@ -1398,37 +1493,52 @@ class JarvisLive:
                     rms = int(math.sqrt(sum(s * s for s in shorts) / count))
                 else:
                     rms = 0
-                is_voice_detected = (rms > VAD_THRESHOLD)
+                rms_thr = WAKE_RMS_THRESHOLD if asleep else VAD_THRESHOLD
+                is_voice_detected = (rms > rms_thr)
+
+            wake_utterance_done = False
 
             if is_voice_detected:
-                # Parole détectée
                 self._vad_silence_start = None
 
                 if not self._vad_is_speaking:
                     self._vad_is_speaking = True
-                    # L'utilisateur commence à parler pendant que JARVIS parle
-                    # → interrompre JARVIS (vrai interruption seulement)
                     with self._speaking_lock:
                         is_playing = self._is_speaking
                     if is_playing:
                         self._clear_audio_queue()
                         print("[JARVIS] 🔇 Interruption détectée par l'utilisateur")
 
+                if asleep:
+                    with self._wake_lock:
+                        self._wake_pcm_buf.extend(data)
+
             else:
-                # Silence
                 if self._vad_is_speaking:
                     if self._vad_silence_start is None:
                         self._vad_silence_start = time.time()
                     elif time.time() - self._vad_silence_start > SILENCE_DURATION:
                         self._vad_is_speaking = False
                         self._vad_silence_start = None
+                        wake_utterance_done = asleep
 
-            # ── Envoyer l'audio à Gemini ─────────────────────────────────────
-            # En mode ACTIF : envoyer l'audio UNIQUEMENT si voix détectée par le VAD
-            # En mode VEILLE : NE PAS envoyer (le wake word est géré localement
-            #                  par _wake_word_listener → zéro tokens Gemini)
+            # ── Mode VEILLE : wake word sur le micro principal ───────────────
+            if asleep:
+                if wake_utterance_done:
+                    with self._wake_lock:
+                        buf = bytes(self._wake_pcm_buf)
+                        self._wake_pcm_buf.clear()
+                    if buf:
+                        threading.Thread(
+                            target=self._try_wake_from_pcm,
+                            args=(buf,),
+                            daemon=True,
+                            name="WakeWordSTT",
+                        ).start()
+                return
+
+            # ── Envoyer l'audio à Gemini (mode ACTIF) ────────────────────────
             if self.awake:
-                # Utilisation du type types.Blob exact avec le rate explicite
                 blob = types.Blob(data=data, mime_type="audio/pcm;rate=16000")
                 loop.call_soon_threadsafe(self._safe_put_audio_chunk, blob)
 
@@ -1455,14 +1565,19 @@ class JarvisLive:
             while True:
                 async for response in self.session.receive():
 
-                    if response.data:
-                        self.audio_in_queue.put_nowait(response.data)
+                    audio_data = getattr(response, "data", None)
+                    sc = response.server_content
+                    if not audio_data and sc and sc.model_turn:
+                        for part in (sc.model_turn.parts or []):
+                            inline = getattr(part, "inline_data", None)
+                            if inline and inline.data:
+                                audio_data = inline.data
+                                break
+                    if audio_data:
+                        self._enqueue_playback(audio_data)
 
-                    if response.server_content:
-                        sc = response.server_content
-
+                    if sc:
                         if sc.output_transcription and sc.output_transcription.text:
-                            self.set_speaking(True)
                             txt = sc.output_transcription.text.strip()
                             if txt:
                                 out_buf.append(txt)
@@ -1484,7 +1599,8 @@ class JarvisLive:
 
 
                         if sc.turn_complete:
-                            self.set_speaking(False)
+                            # Ne pas couper _is_speaking ici : le thread playback
+                            # relâche le micro quand la file audio est vide.
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
@@ -1526,34 +1642,9 @@ class JarvisLive:
             raise
 
     async def _play_audio(self):
-        print("[JARVIS] 🔊 Play started")
-
-        with sd.RawOutputStream(
-            samplerate=RECEIVE_SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=CHUNK_SIZE,
-        ) as stream:
-            try:
-                while True:
-                    chunk = await self.audio_in_queue.get()
-                    self.set_speaking(True)
-                    # ── FFT Playback spectrum ─────────────────────────────────
-                    if _NUMPY_AVAILABLE:
-                        bands = _compute_fft_bands(chunk, RECEIVE_SAMPLE_RATE)
-                        with _fft_lock:
-                            for k in range(FFT_BANDS):
-                                _fft_bands[k] = bands[k]
-                    await asyncio.to_thread(stream.write, chunk)
-            except Exception as e:
-                print(f"[JARVIS] ❌ Play: {e}")
-                raise
-            finally:
-                self.set_speaking(False)
-                # Reset spectrum to zero when playback stops
-                with _fft_lock:
-                    for k in range(FFT_BANDS):
-                        _fft_bands[k] = 0.0
+        """Maintient la tâche asyncio vivante ; lecture PCM dans _start_playback_thread()."""
+        while True:
+            await asyncio.sleep(3600)
 
     # ── Main run loop with reconnection — inspiré d'ADA V2 ───────────────────
 
@@ -1580,6 +1671,9 @@ class JarvisLive:
                     self._loop          = asyncio.get_event_loop()
                     self.audio_in_queue = asyncio.Queue()
                     self.out_queue      = asyncio.Queue(maxsize=10)
+                    self._mic_resume_at = 0.0
+                    self._clear_audio_queue()
+                    self._start_playback_thread()
 
                     print("[JARVIS] ✅ Connected.")
 
