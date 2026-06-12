@@ -48,8 +48,8 @@ except ImportError:
 #  Constantes / Constants
 # ──────────────────────────────────────────────
 
-POLL_INTERVAL_S: float = 2.0
-HISTORY_MAX_SAMPLES: int = 900          # 900 × 2s = 30 minutes
+POLL_INTERVAL_S: float = 3.0
+HISTORY_MAX_SAMPLES: int = 600          # 600 × 3s = 30 minutes
 CPU_ALERT_THRESHOLD_PCT: float = 90.0
 CPU_ALERT_SUSTAIN_S: float = 30.0       # CPU doit rester > seuil pendant 30s
 RAM_ALERT_THRESHOLD_PCT: float = 90.0
@@ -58,6 +58,11 @@ DISK_FREE_ALERT_PCT: float = 10.0       # Alerte si < 10 % libre
 BATTERY_ALERT_PCT: float = 15.0
 SUSPICIOUS_CPU_THRESHOLD: float = 50.0  # Processus inconnu > 50 % CPU
 TOP_PROCESSES_COUNT: int = 5
+
+# Throttle constants (ticks between expensive collections)
+_PROC_EVERY_N_TICKS: int = 4    # process scan every 4 × 3s = 12s
+_DISK_EVERY_N_TICKS: int = 6    # disk scan every 6 × 3s = 18s
+_DRIVE_EVERY_N_TICKS: int = 10  # USB detect every 10 × 3s = 30s
 
 # Processus système Windows connus (liste non-exhaustive)
 KNOWN_PROCESS_NAMES: set[str] = {
@@ -147,6 +152,13 @@ class SystemMonitor:
 
         # WMI instance (initialisée dans le thread) / WMI instance (initialised in thread)
         self._wmi_conn = None
+
+        # ── Cache pour valeurs statiques / Cache for static values ──────────
+        self._cached_cpu_cores: dict | None = None          # cpu count never changes
+        self._cached_disks: list[dict] = []                 # disk layout changes rarely
+        self._cached_top_procs: list[dict] = []             # proc scan throttled
+        self._tick: int = 0                                 # loop tick counter
+        self._wmi_consecutive_failures: int = 0             # skip WMI after repeated failures
 
         print("[SystemMonitor] Instance créée / Instance created")
 
@@ -293,6 +305,7 @@ class SystemMonitor:
 
             while self._running.is_set():
                 try:
+                    self._tick += 1
                     snapshot = self._collect_all()
                     with self._lock:
                         self._current = snapshot
@@ -310,22 +323,44 @@ class SystemMonitor:
     # ══════════════════════════════════════════════
 
     def _collect_all(self) -> dict:
-        """Collecte toutes les métriques et retourne un snapshot horodaté."""
+        """Collecte toutes les métriques et retourne un snapshot horodaté.
+        Throttles expensive collections (processes, disks, USB) to reduce CPU load.
+        """
         snapshot: dict = {
             "timestamp": datetime.now().isoformat(),
         }
 
+        # ── Always collected (cheap) ──────────────────────────────────────────
         snapshot["cpu_percent"] = self._collect_cpu()
-        snapshot["cpu_freq"] = self._collect_cpu_freq()
-        snapshot["cpu_cores"] = self._collect_cpu_cores()
-        snapshot["cpu_temp"] = self._collect_cpu_temp()
-        snapshot["ram"] = self._collect_ram()
+        snapshot["cpu_freq"]    = self._collect_cpu_freq()
+        snapshot["cpu_temp"]    = self._collect_cpu_temp()
+        snapshot["ram"]         = self._collect_ram()
+        snapshot["network"]     = self._collect_network()
+        snapshot["battery"]     = self._collect_battery()
+
+        # ── cpu_cores: static — only read once, then cached ───────────────────
+        if self._cached_cpu_cores is None:
+            self._cached_cpu_cores = self._collect_cpu_cores()
+        snapshot["cpu_cores"] = self._cached_cpu_cores
+
+        # ── GPU: slightly expensive (NVML) — every tick is fine ───────────────
         snapshot["gpu"] = self._collect_gpu()
-        snapshot["disks"] = self._collect_disks()
-        snapshot["network"] = self._collect_network()
-        snapshot["battery"] = self._collect_battery()
-        snapshot["top_processes"] = self._collect_top_processes()
-        snapshot["connected_drives"] = self._detect_and_notify_drives()
+
+        # ── Disk usage: throttled (every N ticks) ─────────────────────────────
+        if self._tick % _DISK_EVERY_N_TICKS == 0 or not self._cached_disks:
+            self._cached_disks = self._collect_disks()
+        snapshot["disks"] = self._cached_disks
+
+        # ── Top processes: expensive psutil scan — throttled ──────────────────
+        if self._tick % _PROC_EVERY_N_TICKS == 0 or not self._cached_top_procs:
+            self._cached_top_procs = self._collect_top_processes()
+        snapshot["top_processes"] = self._cached_top_procs
+
+        # ── USB drive detection: rare event — throttled ───────────────────────
+        if self._tick % _DRIVE_EVERY_N_TICKS == 0:
+            snapshot["connected_drives"] = self._detect_and_notify_drives()
+        else:
+            snapshot["connected_drives"] = sorted(self._known_drives)
 
         return snapshot
 
@@ -372,8 +407,12 @@ class SystemMonitor:
         """
         Tente de lire la température CPU via WMI (OpenHardwareMonitor ou cimv2).
         Falls back gracefully if unavailable.
+        Gives up after 5 consecutive failures to avoid repeated WMI overhead.
         """
         if not WMI_AVAILABLE or self._wmi_conn is None:
+            return None
+        # Stop hammering WMI if it keeps failing (e.g., OpenHardwareMonitor not running)
+        if self._wmi_consecutive_failures >= 5:
             return None
         try:
             # Tentative OpenHardwareMonitor
@@ -383,6 +422,7 @@ class SystemMonitor:
             if sensors:
                 temps = [float(s.Value) for s in sensors if s.Value is not None]
                 if temps:
+                    self._wmi_consecutive_failures = 0
                     return _safe_round(max(temps), 1)
         except Exception:
             pass
@@ -397,10 +437,12 @@ class SystemMonitor:
                 temps_c = [(float(z.CurrentTemperature) / 10.0) - 273.15 for z in zones]
                 valid = [t for t in temps_c if 0 < t < 150]
                 if valid:
+                    self._wmi_consecutive_failures = 0
                     return _safe_round(max(valid), 1)
         except Exception:
             pass
 
+        self._wmi_consecutive_failures += 1
         return None
 
     # ── RAM ───────────────────────────────────────

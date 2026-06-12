@@ -383,10 +383,11 @@ class JarvisUI(QMainWindow):
         """)
         self.mem_btn.clicked.connect(self._show_memory_popup)
         
-        # QTimer for HUD animations (~60 fps)
+        # QTimer for HUD animations (adaptive: 60fps active, 30fps idle)
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self._animate)
-        self.anim_timer.start(16)
+        self.anim_timer.start(16)  # start at 60fps, may slow down in sleeping state
+        self._last_fps_state: str = ""
         
         # Check API config on load
         self._api_key_ready = self._api_keys_exist()
@@ -701,6 +702,15 @@ class JarvisUI(QMainWindow):
         if t % 40 == 0:
             self.status_blink = not self.status_blink
             
+        # 5. Adaptive frame rate: slow down when sleeping to save CPU
+        current_fps_state = self._jarvis_state
+        if current_fps_state != self._last_fps_state:
+            self._last_fps_state = current_fps_state
+            if current_fps_state == "SLEEPING":
+                self.anim_timer.setInterval(33)   # 30 fps in standby
+            else:
+                self.anim_timer.setInterval(16)   # 60 fps active
+
         # Trigger Paint Event
         self.update()
 

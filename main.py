@@ -115,8 +115,10 @@ def _compute_fft_bands(pcm_bytes: bytes, sample_rate: int = 16000) -> list:
 try:
     import speech_recognition as sr
     _SR_AVAILABLE = True
+    _wake_recognizer = sr.Recognizer()   # singleton — avoids repeated init overhead
 except ImportError:
     _SR_AVAILABLE = False
+    _wake_recognizer = None
     print("[WakeWord] [!] SpeechRecognition non installe - wake word local desactive")
 
 import sounddevice as sd
@@ -842,12 +844,12 @@ class JarvisLive:
         if self.awake or not _SR_AVAILABLE or len(pcm_bytes) < 8000:
             return
         try:
-            recognizer = sr.Recognizer()
+            # Réutiliser le recognizer singleton (plus rapide que d'en créer un nouveau)
             audio = sr.AudioData(pcm_bytes, SEND_SAMPLE_RATE, 2)
             try:
-                text = recognizer.recognize_google(audio, language="fr-FR").lower()
+                text = _wake_recognizer.recognize_google(audio, language="fr-FR").lower()
             except (sr.UnknownValueError, sr.RequestError):
-                text = recognizer.recognize_google(audio, language="en-US").lower()
+                text = _wake_recognizer.recognize_google(audio, language="en-US").lower()
 
             text = re.sub(r"[^\w\s]", "", text).strip()
             if not text:
@@ -961,7 +963,7 @@ class JarvisLive:
         if self._playback_thread and self._playback_thread.is_alive():
             return
 
-        self._playback_q = thread_queue.Queue(maxsize=128)
+        self._playback_q = thread_queue.Queue(maxsize=64)
         self._playback_stop.clear()
         loop = self._loop
 
@@ -999,7 +1001,7 @@ class JarvisLive:
                     stream.write(chunk)
 
                     fft_tick += 1
-                    if _NUMPY_AVAILABLE and fft_tick % 12 == 0 and loop:
+                    if _NUMPY_AVAILABLE and fft_tick % 20 == 0 and loop:
                         bands = _compute_fft_bands(chunk, RECEIVE_SAMPLE_RATE)
                         with _fft_lock:
                             for k in range(FFT_BANDS):
