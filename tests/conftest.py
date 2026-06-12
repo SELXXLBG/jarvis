@@ -1,9 +1,17 @@
 """
 Configuration et fixtures pour les tests pytest.
 """
+import sys
+from unittest.mock import MagicMock
+# Mock out heavyweight/unstable dependencies to avoid WinError 1114 DLL conflicts and WMI COM access violations
+sys.modules['torch'] = MagicMock()
+sys.modules['sentence_transformers'] = MagicMock()
+sys.modules['core.system_monitor'] = MagicMock()
+sys.modules['chromadb'] = MagicMock()
+sys.modules['onnxruntime'] = MagicMock()
+
 import pytest
 from unittest.mock import Mock, patch, AsyncMock
-import sys
 import os
 
 # Ajouter le répertoire racine au path Python

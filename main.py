@@ -1977,7 +1977,7 @@ def main():
             print("\n🔴 Shutting down...")
 
     threading.Thread(target=runner, daemon=True).start()
-    ui.root.mainloop()
+    sys.exit(ui.app.exec_())
 
 
 if __name__ == "__main__":
