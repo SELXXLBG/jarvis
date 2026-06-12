@@ -10,6 +10,9 @@ import struct
 import math
 import array
 from pathlib import Path
+import requests
+import backoff
+from loguru import logger
 
 try:
     import numpy as np
@@ -190,7 +193,7 @@ def get_base_dir():
 import core.profile_loader
 
 BASE_DIR        = get_base_dir()
-LIVE_MODEL          = "gemini-2.5-flash-native-audio-latest"
+LIVE_MODEL          = "gemini-2.5-flash"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -1565,14 +1568,21 @@ class JarvisLive:
             while True:
                 async for response in self.session.receive():
 
-                    audio_data = getattr(response, "data", None)
+                    audio_data = None
                     sc = response.server_content
-                    if not audio_data and sc and sc.model_turn:
+                    if sc and sc.model_turn:
                         for part in (sc.model_turn.parts or []):
                             inline = getattr(part, "inline_data", None)
                             if inline and inline.data:
                                 audio_data = inline.data
                                 break
+                            
+                            # Nouveau SDK GenAI: parfois l'audio est dans executable_code ou juste part.data
+                            # On gère le fallback si inline_data n'existe pas
+                            elif getattr(part, "data", None):
+                                audio_data = part.data
+                                break
+
                     if audio_data:
                         self._enqueue_playback(audio_data)
 

@@ -33,4 +33,6 @@ sentence-transformers
 python-telegram-bot
 schedule
 pyttsx3
+backoff
+loguru
 

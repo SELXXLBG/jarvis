@@ -100,3 +100,7 @@ class LocalVAD:
         # out[0][0] contient la probabilité (0.0 à 1.0) qu'il y ait de la parole
         prob = float(out[0][0])
         return prob > threshold
+
+
+# Alias pour compatibilité avec les tests
+VAD = LocalVAD
